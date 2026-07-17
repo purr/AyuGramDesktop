@@ -256,6 +256,10 @@ jobs:
         with:
           arch: x64
           sdk: ${{ env.SDK }}
+          # Pin the toolset. The runner's VS 2026 image defaults to MSVC 14.51,
+          # but the app is linked with v143 (14.44); building the deps with 14.51
+          # emits __std_* STL helpers that 14.44's link libs lack -> LNK2019.
+          toolset: '14.44'
 
       # Restore only — windows_deps owns writing these. The primary key cannot
       # match (no run_id/run_attempt suffix), so it always falls through to the
@@ -264,19 +268,19 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}
+          key: ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}
           restore-keys: |
-            ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-
-            ${{ runner.os }}-x64-third-party-
+            ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-third-party-
 
       - name: Restore Libraries cache.
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\Libraries
-          key: ${{ runner.os }}-x64-libs-${{ env.CACHE_KEY }}
+          key: ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}
           restore-keys: |
-            ${{ runner.os }}-x64-libs-${{ env.CACHE_KEY }}-
-            ${{ runner.os }}-x64-libs-
+            ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-libs-
 
       - name: AyuGram build.
         run: |
@@ -398,7 +402,6 @@ jobs:
           $IMAGE_TAG \
           /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
           -D CMAKE_CONFIGURATION_TYPES=Release \
-          -D CMAKE_EXE_LINKER_FLAGS="-s" \
           -D TDESKTOP_API_ID=$API_ID \
           -D TDESKTOP_API_HASH=$API_HASH \
           -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \

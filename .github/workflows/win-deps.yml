@@ -89,6 +89,10 @@ jobs:
         with:
           arch: x64
           sdk: ${{ env.SDK }}
+          # Pin the toolset. The runner's VS 2026 image defaults to MSVC 14.51,
+          # but the app is linked with v143 (14.44); building the deps with 14.51
+          # emits __std_* STL helpers that 14.44's link libs lack -> LNK2019.
+          toolset: '14.44'
 
       - name: NuGet sources.
         run: |
@@ -102,19 +106,19 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
+          key: ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
           restore-keys: |
-            ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-
-            ${{ runner.os }}-x64-third-party-
+            ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-third-party-
 
       - name: Restore Libraries cache.
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\Libraries
-          key: ${{ runner.os }}-x64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
+          key: ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
           restore-keys: |
-            ${{ runner.os }}-x64-libs-${{ env.CACHE_KEY }}-
-            ${{ runner.os }}-x64-libs-
+            ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-libs-
 
       - name: Mark start.
         shell: bash
@@ -163,14 +167,14 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\ThirdParty
-          key: ${{ runner.os }}-x64-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
+          key: ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
 
       - name: Save Libraries cache.
         if: always()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.TBUILD }}\Libraries
-          key: ${{ runner.os }}-x64-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
+          key: ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ inputs.attempt }}
 
       # Last, so the caches are always banked first and the verdict reads last.
       # Distinguishes "ran out of time" (chain on) from "actually broke" (stop):
