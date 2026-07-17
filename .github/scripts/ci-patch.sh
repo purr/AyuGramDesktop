@@ -30,6 +30,19 @@ fail() {
 	exit 1
 }
 
+# `sed -i EXPR FILE` is GNU-only. BSD sed (macOS) reads the token after -i as a
+# backup suffix, so it swallows EXPR and then treats FILE as the script:
+# "invalid command code f", exit 1. Write through a temp file instead — that
+# behaves identically everywhere and needs no GNU/BSD branch.
+sed_i() { # sed_i <expr> <file>
+	local tmp
+	# Template is explicit: BSD mktemp requires one. Placing it beside the target
+	# also keeps the mv on the same filesystem.
+	tmp="$(mktemp "$2.ci-patch.XXXXXX")" || fail "mktemp failed next to $2"
+	sed "$1" "$2" > "$tmp" || { rm -f "$tmp"; fail "sed '$1' failed on $2"; }
+	mv "$tmp" "$2" || { rm -f "$tmp"; fail "could not write $2"; }
+}
+
 for f in "$PREPARE" "$INFRA"; do
 	[ -f "$f" ] || fail "$f not found — wrong root?"
 done
@@ -45,7 +58,7 @@ done
 # ---------------------------------------------------------------------------
 
 if grep -q 'CONFIGURATIONS=-debug-and-release' "$PREPARE"; then
-	sed -i 's/CONFIGURATIONS=-debug-and-release/CONFIGURATIONS=-release/g' "$PREPARE"
+	sed_i 's/CONFIGURATIONS=-debug-and-release/CONFIGURATIONS=-release/g' "$PREPARE"
 	echo "patched: Qt configured -release (was -debug-and-release)"
 elif grep -q 'CONFIGURATIONS=-release' "$PREPARE"; then
 	echo "skipped: Qt already -release"
@@ -60,10 +73,30 @@ fi
 # their release steps read state the debug step leaves behind.
 if grep -q 'cmake --build out --config Debug' "$PREPARE"; then
 	COUNT=$(grep -c 'cmake --build out --config Debug' "$PREPARE")
-	sed -i '/cmake --build out --config Debug/d' "$PREPARE"
+	sed_i '/cmake --build out --config Debug/d' "$PREPARE"
 	echo "patched: dropped $COUNT Debug library builds"
 else
 	echo "skipped: Debug library builds already dropped"
+fi
+
+# breakpad builds a `dump_syms` tool that #includes ATL (atlbase.h,
+# atlcomcli.h). The runners' Visual Studio has no ATL component, so it dies with
+# C1083 and takes the whole dependency build with it.
+#
+# Nothing we build needs it: dump_syms only dumps symbols for the crash-report
+# upload pipeline, and it is referenced solely by Telegram/build/build.bat and
+# build.sh — the official deploy scripts, which CI never runs. CMake never looks
+# for it, and we build with DESKTOP_APP_DISABLE_CRASH_REPORTS=ON regardless.
+# breakpad's actual libraries still build; only the tool is dropped.
+#
+# Upstream CI never trips over this because it passes skip-release, which skips
+# the entire `release:` block these lines live in.
+if grep -q 'dump_syms' "$PREPARE"; then
+	COUNT=$(grep -c 'dump_syms' "$PREPARE")
+	sed_i '/dump_syms/d' "$PREPARE"
+	echo "patched: dropped $COUNT dump_syms lines (needs ATL, absent from the runners' VS)"
+else
+	echo "skipped: dump_syms already dropped"
 fi
 
 # ---------------------------------------------------------------------------
@@ -76,8 +109,9 @@ fi
 # stop being refreshed from Radolyn's server.
 # ---------------------------------------------------------------------------
 
-if grep -qE '^\s*initRCManager\(\);' "$INFRA"; then
-	sed -i -E 's|^(\s*)initRCManager\(\);|\1// initRCManager(); // ci-patch: no update.ayugram.one beacon|' "$INFRA"
+# POSIX classes, not \s: BSD grep/sed do not understand GNU's \s shorthand.
+if grep -q '^[[:space:]]*initRCManager();' "$INFRA"; then
+	sed_i 's|^\([[:space:]]*\)initRCManager();|\1// initRCManager(); // ci-patch: no update.ayugram.one beacon|' "$INFRA"
 	echo "patched: RCManager beacon disabled"
 elif grep -q 'ci-patch: no update.ayugram.one beacon' "$INFRA"; then
 	echo "skipped: RCManager beacon already disabled"
