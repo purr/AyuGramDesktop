@@ -100,8 +100,10 @@ jobs:
           MARKER="Built by GitHub Actions from \`${{ github.sha }}\`"
 
           # macOS is continue-on-error by design, so its absence proves nothing.
-          # These two do.
-          REQUIRED="AyuGram-windows-x64.zip AyuGram-linux-x64.tar.gz"
+          # These do. Listing the installers too means a release published before
+          # they existed counts as incomplete and gets rebuilt, rather than being
+          # copied forward with half its assets missing.
+          REQUIRED="AyuGram-windows-x64.zip AyuGram-windows-x64-setup.exe AyuGram-linux-x64.tar.gz AyuGram-linux-x64.AppImage"
 
           FOUND=""
           # $TARGET first, by name: 'gh release list' is newest-first by CREATION
@@ -324,11 +326,70 @@ jobs:
           cd package
           7z a -tzip ../AyuGram-windows-x64.zip .
 
+      # The zip above is the portable build; this is the ordinary Windows way to
+      # install one. ci-patch.sh has already reconciled setup.iss with what this
+      # job actually produces — AyuGram.exe, no Updater.exe, no code signing.
+      #
+      # Never fatal. The zip is the deliverable and it already exists by now;
+      # losing it because a convenience artifact failed would be a straight
+      # regression. The ::error:: annotations below still surface the failure,
+      # and the guard's REQUIRED list makes the next run rebuild rather than
+      # reuse a release that came out short.
+      - name: Installer.
+        shell: bash
+        continue-on-error: true
+        run: |
+          BUILD="$TBUILD/$REPO_NAME/Telegram/build"
+          OUT="$TBUILD/$REPO_NAME/out/Release"
+
+          # The same defines build.bat passes, read from the same file it reads.
+          # AppVersionStrFull only differs from AppVersionStr on alpha and beta
+          # builds, which CI never produces.
+          VER_SMALL=$(awk '$1 == "AppVersionStrSmall" { print $2 }' "$BUILD/version")
+          VER_FULL=$(awk '$1 == "AppVersionStr" { print $2 }' "$BUILD/version")
+          [ -n "$VER_SMALL" ] && [ -n "$VER_FULL" ] \
+            || { echo "::error::Could not read the version out of $BUILD/version"; exit 1; }
+
+          ISCC='C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if [ ! -f "$ISCC" ]; then
+            ISCC=$(command -v iscc) \
+              || { echo "::error::Inno Setup not found on the runner"; exit 1; }
+          fi
+
+          # ISCC is a native Windows program, so every path it is handed has to
+          # be a Windows path rather than the MSYS one bash uses here — hence
+          # cygpath -w.
+          #
+          # MSYS2_ARG_CONV_EXCL is the other half, and it is not optional: when
+          # bash execs a native exe, the MSYS runtime rewrites any argument that
+          # looks like a rooted POSIX path. '/dMyAppVersion=6.7.8' becomes
+          # 'C:/Program Files/Git/dMyAppVersion=6.7.8', which no longer starts
+          # with '/' or '-', so ISCC reads it as a second script filename and
+          # dies with "You may not specify more than one script filename."
+          # Every path here is already Windows-form, so no argument on this line
+          # wants converting. '*' turns the whole heuristic off.
+          MSYS2_ARG_CONV_EXCL='*' "$ISCC" \
+            /dMyAppVersion="$VER_SMALL" \
+            /dMyAppVersionFull="$VER_FULL" \
+            /dMyBuildTarget=win64 \
+            /dReleasePath="$(cygpath -w "$OUT")" \
+            "$(cygpath -w "$BUILD/setup.iss")"
+
+          # setup.iss writes to OutputDir={#ReleasePath}. Rename it to a fixed
+          # asset name: with the version in the filename, the rolling
+          # 'continuous' release would keep one installer per app version for
+          # ever, since assets are only replaced when the name matches.
+          SETUP="$OUT/ayusetup-x64.$VER_FULL.exe"
+          [ -f "$SETUP" ] || { echo "::error::ISCC reported success but $SETUP is missing"; ls -la "$OUT"; exit 1; }
+          mv "$SETUP" AyuGram-windows-x64-setup.exe
+
       - name: Upload artifact.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: AyuGram-windows-x64
-          path: AyuGram-windows-x64.zip
+          path: |
+            AyuGram-windows-x64.zip
+            AyuGram-windows-x64-setup.exe
           if-no-files-found: error
 
   linux:
@@ -421,12 +482,116 @@ jobs:
           fi
           tar -czf AyuGram-linux-x64.tar.gz -C out/Release AyuGram
 
+      # Linux has no single native installer, so the portable tarball above is
+      # joined by an AppImage: one executable file, no root, no package manager,
+      # and it registers its own menu entry and tg:// handler when integrated.
+      #
+      # The binary out of centos_env is self-contained the same way upstream's
+      # own Linux release is, so the AppDir needs nothing bundled alongside it.
+      # Never fatal, for the same reason as the Windows installer: the tarball
+      # already exists and must not be lost to a convenience artifact.
+      - name: AppImage.
+        if: env.ONLY_CACHE == 'false'
+        continue-on-error: true
+        env:
+          # Release assets are mutable under any tag, so pin the bytes rather
+          # than a version. If either check below ever fails, upstream rebuilt
+          # the file: verify the new one and update the hash, do not delete the
+          # check.
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+          # appimagetool does not bundle the type-2 runtime. Left to itself it
+          # fetches one from a rolling tag with no integrity check at all, and
+          # that runtime is prepended to the output — it is the first code that
+          # runs on a user's machine. type2-runtime does publish dated releases,
+          # so pin one and hand it over explicitly.
+          RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        run: |
+          set -euo pipefail
+
+          APPDIR=AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications"
+          cp out/Release/AyuGram "$APPDIR/usr/bin/"
+          chmod +x "$APPDIR/usr/bin/AyuGram"
+
+          # Derived from the tracked desktop entry so the translations, MIME
+          # handlers and actions stay in sync, minus the three keys that only
+          # make sense for a packaged install:
+          #   TryExec       resolves against PATH, and an AppImage is not on it;
+          #   DBusActivatable needs the .service file an AppImage cannot install;
+          #   env in Exec  breaks the desktop-integration tools, which rewrite
+          #                Exec by replacing its first token with the AppImage.
+          sed -e '/^TryExec=/d' \
+              -e '/^DBusActivatable=/d' \
+              -e 's|^Exec=env DESKTOPINTEGRATION=1 |Exec=|' \
+              lib/xdg/com.ayugram.desktop.desktop > "$APPDIR/com.ayugram.desktop.desktop"
+          # Check the [Desktop Entry] Exec specifically. A plain grep over the
+          # file would be satisfied by '[Desktop Action quit]'s own Exec=, which
+          # the sed never touches — so it would pass even if the main Exec= line
+          # were reworded or deleted outright, which is the one thing this is
+          # here to catch.
+          MAIN_EXEC=$(awk '/^\[Desktop Entry\]/ { d = 1; next } /^\[/ { d = 0 } d && /^Exec=/ { print; exit }' \
+            "$APPDIR/com.ayugram.desktop.desktop")
+          case "$MAIN_EXEC" in
+            "Exec=AyuGram "*) ;;
+            *)
+              echo "::error::[Desktop Entry] Exec= is not what this step expects: '${MAIN_EXEC:-<none>}'"
+              grep -n '^Exec=' "$APPDIR/com.ayugram.desktop.desktop"
+              exit 1
+              ;;
+          esac
+          cp "$APPDIR/com.ayugram.desktop.desktop" "$APPDIR/usr/share/applications/"
+
+          # Icon= names com.ayugram.desktop, so every copy must too. The root
+          # one and .DirIcon are what the AppImage spec reads; the hicolor tree
+          # is what the desktop uses once the AppImage is integrated.
+          for size in 16 32 48 64 128 256 512; do
+            src="Telegram/Resources/art/icon$size.png"
+            [ -f "$src" ] || continue
+            dest="$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dest"
+            cp "$src" "$dest/com.ayugram.desktop.png"
+          done
+          cp Telegram/Resources/art/icon256.png "$APPDIR/com.ayugram.desktop.png"
+          cp Telegram/Resources/art/icon256.png "$APPDIR/.DirIcon"
+
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="$HERE/usr/bin:$PATH"
+          export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          exec "$HERE/usr/bin/AyuGram" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+          fetch() { # fetch <url> <dest> <sha256>
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 -o "$2" "$1"
+            echo "$3  $2" | sha256sum -c - \
+              || { echo "::error::$2 does not match its pinned hash — see the comments in this step's env block"; exit 1; }
+          }
+          fetch "$APPIMAGETOOL_URL" appimagetool "$APPIMAGETOOL_SHA256"
+          fetch "$RUNTIME_URL" runtime-x86_64 "$RUNTIME_SHA256"
+          chmod +x appimagetool
+
+          # ubuntu-latest has no libfuse2, so the tool cannot mount itself;
+          # extract-and-run is the supported way round that. It also re-execs
+          # from a temp directory, which is why the runtime needs an absolute
+          # path rather than the relative one that works everywhere else here.
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool \
+            --runtime-file "$PWD/runtime-x86_64" \
+            "$APPDIR" AyuGram-linux-x64.AppImage
+          chmod +x AyuGram-linux-x64.AppImage
+
       - name: Upload artifact.
         if: env.ONLY_CACHE == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: AyuGram-linux-x64
-          path: AyuGram-linux-x64.tar.gz
+          path: |
+            AyuGram-linux-x64.tar.gz
+            AyuGram-linux-x64.AppImage
           if-no-files-found: error
 
   macos:
@@ -525,15 +690,51 @@ jobs:
             ls -la "$OUT" || true
             exit 1
           fi
+          # The build runs with CODE_SIGNING_ALLOWED=NO, which leaves the bundle
+          # with no signature at all — and macOS on Apple Silicon refuses to
+          # launch such a binary outright. An ad-hoc signature ('-') costs
+          # nothing, needs no certificate, and turns that hard refusal back into
+          # the ordinary unidentified-developer prompt. Never fatal: an unsigned
+          # bundle is still worth shipping, and it is what we shipped before.
+          if codesign --force --deep --sign - "$OUT/AyuGram.app" \
+            && codesign --verify --deep "$OUT/AyuGram.app"; then
+            echo "Ad-hoc signed."
+          else
+            echo "::warning::Ad-hoc signing failed — the bundle ships unsigned and will not launch on Apple Silicon."
+          fi
+
           # ditto, not zip: it preserves the bundle's symlinks and permission bits.
           ditto -c -k --sequesterRsrc --keepParent "$OUT/AyuGram.app" AyuGram-macos.zip
+
+      # The .dmg is how macOS software is actually handed out: mount it, drag the
+      # app onto the Applications alias sitting next to it, eject. Its own step,
+      # and never fatal, so a dmg failure cannot cost us the zip made above —
+      # this runner is the one most likely to run out of disk, and hdiutil is
+      # known to hit transient 'resource busy' on hosted runners.
+      - name: DMG.
+        if: env.ONLY_CACHE == 'false'
+        continue-on-error: true
+        run: |
+          OUT="$REPO_NAME/out/Release"
+
+          # mv rather than a second ditto: the zip is already made and nothing
+          # reads the bundle after this, so there is no reason to hold two full
+          # copies on a volume this job had to delete Xcode installs to fit in.
+          STAGE="$(mktemp -d)/AyuGram"
+          mkdir -p "$STAGE"
+          mv "$OUT/AyuGram.app" "$STAGE/AyuGram.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname AyuGram -srcfolder "$STAGE" \
+            -fs HFS+ -format UDZO -ov AyuGram-macos.dmg
 
       - name: Upload artifact.
         if: env.ONLY_CACHE == 'false'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: AyuGram-macos
-          path: AyuGram-macos.zip
+          path: |
+            AyuGram-macos.zip
+            AyuGram-macos.dmg
           if-no-files-found: error
 
   release:
@@ -604,10 +805,16 @@ jobs:
 
           # Report by artifact presence. needs.macos.result cannot be trusted:
           # job-level continue-on-error rewrites it to 'success' on failure.
-          for row in "windows:AyuGram-windows-x64.zip" "linux:AyuGram-linux-x64.tar.gz" "macos:AyuGram-macos.zip"; do
+          for row in \
+            "windows_setup:AyuGram-windows-x64-setup.exe" \
+            "windows:AyuGram-windows-x64.zip" \
+            "linux_setup:AyuGram-linux-x64.AppImage" \
+            "linux:AyuGram-linux-x64.tar.gz" \
+            "macos_setup:AyuGram-macos.dmg" \
+            "macos:AyuGram-macos.zip"; do
             k="${row%%:*}"; f="${row#*:}"
             if [ -f "dist/$f" ]; then
-              echo "$k=attached" >> $GITHUB_OUTPUT
+              echo "$k=\`$f\`" >> $GITHUB_OUTPUT
             else
               echo "$k=not built" >> $GITHUB_OUTPUT
             fi
@@ -620,6 +827,35 @@ jobs:
           # tag has to be moved by hand or 'continuous' stays on the first build.
           git tag -f continuous ${{ github.sha }}
           git push -f origin refs/tags/continuous
+
+      # Publishing only ever replaces same-named assets, never removes others.
+      # So a run where one platform failed would leave that platform's assets
+      # from a PREVIOUS commit sitting on the release, under a body that now
+      # claims this commit. The guard checks completeness by asset name only, so
+      # it would then read that release as fully built and either skip a rebuild
+      # or copy another commit's binaries forward onto a permanent v* tag.
+      #
+      # Deleting what this run did not produce keeps the release honest: it goes
+      # out short, the guard sees it as incomplete, and the next run rebuilds.
+      - name: Drop assets this run is not replacing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG='${{ steps.meta.outputs.tag }}'
+
+          # No release yet on a first publish — nothing to prune, not an error.
+          ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+
+          for a in $ASSETS; do
+            if [ ! -f "dist/$a" ]; then
+              echo "Deleting stale '$a' — this run did not produce it."
+              # A warning, not a failure: leaving a stale asset behind is worse
+              # than publishing, and the guard will still force a rebuild.
+              gh release delete-asset "$TAG" "$a" --repo "$GITHUB_REPOSITORY" -y \
+                || echo "::warning::Could not delete stale asset '$a'."
+            fi
+          done
 
       - name: Publish.
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
@@ -636,8 +872,25 @@ jobs:
             Auto-update is disabled in these builds, so they will not replace
             themselves with binaries from AyuGram's own update server.
 
-            | Platform | Asset |
-            | --- | --- |
-            | Windows x64 | ${{ steps.meta.outputs.windows }} |
-            | Linux x64 | ${{ steps.meta.outputs.linux }} |
-            | macOS | ${{ steps.meta.outputs.macos }} |
+            | Platform | Installer | Portable |
+            | --- | --- | --- |
+            | Windows x64 | ${{ steps.meta.outputs.windows_setup }} | ${{ steps.meta.outputs.windows }} |
+            | Linux x64 | ${{ steps.meta.outputs.linux_setup }} | ${{ steps.meta.outputs.linux }} |
+            | macOS | ${{ steps.meta.outputs.macos_setup }} | ${{ steps.meta.outputs.macos }} |
+
+            **Windows** — the installer is per-user, so it needs no administrator
+            rights and installs into `%APPDATA%\AyuGram Desktop`. It is not
+            code-signed, so SmartScreen will warn: *More info* → *Run anyway*.
+
+            **Linux** — `chmod +x AyuGram-linux-x64.AppImage`, then run it. No
+            root and no package manager involved.
+
+            **macOS** — open the `.dmg` and drag AyuGram to Applications. The app
+            is only ad-hoc signed, never notarised, so macOS blocks the first
+            launch. Clear the quarantine flag:
+            ```
+            xattr -dr com.apple.quarantine /Applications/AyuGram.app
+            ```
+            Without a terminal: try to open it, dismiss the warning, then go to
+            System Settings → Privacy & Security → *Open Anyway*. (Control-click
+            → *Open* no longer works — Apple removed that route in macOS 15.)

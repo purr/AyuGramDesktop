@@ -24,6 +24,7 @@ cd "$ROOT"
 
 PREPARE="Telegram/build/prepare/prepare.py"
 INFRA="Telegram/SourceFiles/ayu/ayu_infra.cpp"
+SETUP="Telegram/build/setup.iss"
 
 fail() {
 	echo "::error::ci-patch: $1"
@@ -43,7 +44,7 @@ sed_i() { # sed_i <expr> <file>
 	mv "$tmp" "$2" || { rm -f "$tmp"; fail "could not write $2"; }
 }
 
-for f in "$PREPARE" "$INFRA"; do
+for f in "$PREPARE" "$INFRA" "$SETUP"; do
 	[ -f "$f" ] || fail "$f not found — wrong root?"
 done
 
@@ -117,6 +118,58 @@ elif grep -q 'ci-patch: no update.ayugram.one beacon' "$INFRA"; then
 	echo "skipped: RCManager beacon already disabled"
 else
 	fail "no initRCManager() call site in $INFRA — upstream changed init(), re-check this patch"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Make the Inno Setup script compile against what CI actually produces.
+#
+# setup.iss is written for the official release pipeline, which CI is not:
+#   - it installs Telegram.exe, but our CMake sets output_name to AyuGram;
+#   - it installs Updater.exe, which DESKTOP_APP_DISABLE_AUTOUPDATE never
+#     builds — so ISCC would abort on a missing source file;
+#   - SignTool=sha256 names a signing tool that only exists on the release
+#     machine's Inno install, and we hold no code-signing certificate.
+# ---------------------------------------------------------------------------
+
+if grep -q 'Telegram\.exe' "$SETUP"; then
+	sed_i 's/Telegram\.exe/AyuGram.exe/g' "$SETUP"
+	echo "patched: setup.iss installs AyuGram.exe"
+elif grep -q 'Source:.*AyuGram\.exe' "$SETUP"; then
+	# Anchored on the Source: line, not on a bare AyuGram.exe: a pristine
+	# setup.iss already carries `#define MyAppExeName "AyuGram.exe"`, which this
+	# rule never touches, so the looser test would match every time and the fail
+	# below could never fire.
+	echo "skipped: setup.iss already names AyuGram.exe"
+else
+	fail "no Telegram.exe reference in $SETUP — upstream reworked the installer, re-check this patch"
+fi
+
+if grep -q 'Source:.*Updater\.exe' "$SETUP"; then
+	sed_i '/Source:.*Updater\.exe/d' "$SETUP"
+	echo "patched: dropped Updater.exe from the installer (autoupdate is off, so it is never built)"
+else
+	echo "skipped: Updater.exe already absent from the installer"
+fi
+
+if grep -q '^SignTool=' "$SETUP"; then
+	sed_i '/^SignTool=/d' "$SETUP"
+	echo "patched: dropped SignTool (no code-signing certificate in CI)"
+else
+	echo "skipped: SignTool already dropped"
+fi
+
+# Qt6 builds emit no ANGLE, so this DLL is genuinely absent there and ISCC
+# treats a missing [Files] source as a fatal error. The Package step in the
+# workflow tolerates its absence the same way.
+if grep -q 'd3dcompiler_47\.dll' "$SETUP"; then
+	if grep -q 'd3dcompiler_47.dll.*skipifsourcedoesntexist' "$SETUP"; then
+		echo "skipped: d3dcompiler_47.dll already optional"
+	else
+		sed_i 's|\(d3dcompiler_47\.dll.*Flags: ignoreversion\)|\1 skipifsourcedoesntexist|' "$SETUP"
+		echo "patched: d3dcompiler_47.dll is optional in the installer"
+	fi
+else
+	fail "no d3dcompiler_47.dll entry in $SETUP — upstream reworked the installer, re-check this patch"
 fi
 
 echo "ci-patch: done"
