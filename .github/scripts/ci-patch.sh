@@ -80,6 +80,34 @@ else
 	echo "skipped: Debug library builds already dropped"
 fi
 
+# jom builds a Qt module's plugins in parallel, and each plugin's qmake writes
+# a qt_plugin_*.pri into the module's own mkspecs\modules-inst\ directory,
+# creating it first if missing. Those concurrent creates race; the loser dies
+# with "Cannot write file ...: Cannot create parent directory" and takes the
+# whole Qt stage (and hours of runner time) with it. Pre-creating the
+# directories before jom starts makes the create a no-op. The inserted line is
+# doubled-backslash because it lands inside a Python string literal, and it
+# starts with 'for' so prepare.py's command wrapper does not prefix it with
+# 'call' (winFailOnEach in prepare.py).
+if grep -q 'modules-inst' "$PREPARE"; then
+	echo "skipped: Qt mkspecs/modules-inst already pre-created"
+else
+	# awk, not sed: this inserts a line, and sed's 'i' command syntax differs
+	# between GNU and BSD. The \r? keeps the match working on a CRLF checkout.
+	tmp="$(mktemp "$PREPARE.ci-patch.XXXXXX")" || fail "mktemp failed next to $PREPARE"
+	awk '
+		/^    jom -j%NUMBER_OF_PROCESSORS%\r?$/ && !done {
+			print "    for %%m in (qtbase qtimageformats qtsvg) do if not exist %%m\\\\mkspecs\\\\modules-inst mkdir %%m\\\\mkspecs\\\\modules-inst"
+			done = 1
+		}
+		{ print }
+	' "$PREPARE" > "$tmp" || { rm -f "$tmp"; fail "awk failed on $PREPARE"; }
+	mv "$tmp" "$PREPARE" || { rm -f "$tmp"; fail "could not write $PREPARE"; }
+	grep -q 'modules-inst' "$PREPARE" \
+		|| fail "no bare 'jom -j%NUMBER_OF_PROCESSORS%' line in $PREPARE — upstream changed the Qt stage, re-check this patch"
+	echo "patched: Qt mkspecs/modules-inst dirs pre-created (parallel qmake race)"
+fi
+
 # breakpad builds a `dump_syms` tool that #includes ATL (atlbase.h,
 # atlcomcli.h). The runners' Visual Studio has no ATL component, so it dies with
 # C1083 and takes the whole dependency build with it.
