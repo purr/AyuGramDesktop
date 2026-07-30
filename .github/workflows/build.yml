@@ -285,6 +285,16 @@ jobs:
             ${{ runner.os }}-x64-t1444-libs-
 
       - name: AyuGram build.
+        env:
+          # MSBuild runs the 32-bit hosted cl.exe unless this says otherwise,
+          # and a 32-bit compiler has ~4 GB of address space to work in. The
+          # largest translation units here — mainwidget.cpp, and the generated
+          # qrc_emoji_*.cpp, one of which is 90k+ lines — exhaust that and die
+          # with C1060 "compiler is out of heap space". The 64-bit host has the
+          # same toolset version and emits the same x64 code; it simply has
+          # room. CMake's own '-T host=x64' is not available to us: run_cmake.py
+          # hard-codes '-T v143', and cmake rejects a second -T.
+          PreferredToolArchitecture: x64
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
 
@@ -297,7 +307,12 @@ jobs:
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
           if %errorlevel% neq 0 exit /b %errorlevel%
 
-          cmake --build ..\out --config Release --parallel
+          rem No --parallel. It would hand MSBuild an unbounded /m, and
+          rem cmake/options_win.cmake already compiles every target with /MP,
+          rem so the two multiply: up to cores-squared concurrent cl.exe on a
+          rem 4-core, 16 GB runner. /MP on its own keeps all four cores busy
+          rem inside a project while leaving each compiler enough memory.
+          cmake --build ..\out --config Release
           if %errorlevel% neq 0 exit /b %errorlevel%
 
       - name: Package.
