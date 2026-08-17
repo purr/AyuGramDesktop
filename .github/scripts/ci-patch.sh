@@ -89,22 +89,41 @@ fi
 # doubled-backslash because it lands inside a Python string literal, and it
 # starts with 'for' so prepare.py's command wrapper does not prefix it with
 # 'call' (winFailOnEach in prepare.py).
-if grep -q 'modules-inst' "$PREPARE"; then
+# The idempotency guard tests for OUR inserted line, not for the bare word
+# 'modules-inst'. Upstream hit this same race and, as of tdesktop 7.0.9, works
+# around it with `jom || jom` under a `rem ... modules-inst ...` comment. A
+# guard on the bare word matches that comment, so this block would report
+# "already pre-created" and insert nothing — silently dropping the fix, which
+# is the exact failure mode this script exists to avoid. The two mitigations
+# are complementary: we stop the race, their retry survives it.
+if grep -q 'for %%m in (qtbase' "$PREPARE"; then
 	echo "skipped: Qt mkspecs/modules-inst already pre-created"
 else
 	# awk, not sed: this inserts a line, and sed's 'i' command syntax differs
-	# between GNU and BSD. The \r? keeps the match working on a CRLF checkout.
+	# between GNU and BSD.
+	#
+	# The anchor matches the Qt build invocation by shape, not by exact text:
+	# leading whitespace, then `jom -jN`, minus the `rem` comment and the
+	# build_libs/clean/install invocations that belong to other stages. That
+	# matched the bare line before 7.0.9 and matches `jom -jN || jom -jN`
+	# after it, so upstream reworking that command's flags again does not
+	# silently skip. Indentation is copied from the matched line, so a
+	# re-indent of the stage stays correct too.
 	tmp="$(mktemp "$PREPARE.ci-patch.XXXXXX")" || fail "mktemp failed next to $PREPARE"
 	awk '
-		/^    jom -j%NUMBER_OF_PROCESSORS%\r?$/ && !done {
-			print "    for %%m in (qtbase qtimageformats qtsvg) do if not exist %%m\\\\mkspecs\\\\modules-inst mkdir %%m\\\\mkspecs\\\\modules-inst"
+		!done \
+		&& /^[[:space:]]*jom -j%NUMBER_OF_PROCESSORS%/ \
+		&& $0 !~ /^[[:space:]]*rem/ \
+		&& $0 !~ /build_libs/ && $0 !~ /clean/ && $0 !~ /install/ {
+			match($0, /^[[:space:]]*/)
+			print substr($0, 1, RLENGTH) "for %%m in (qtbase qtimageformats qtsvg) do if not exist %%m\\\\mkspecs\\\\modules-inst mkdir %%m\\\\mkspecs\\\\modules-inst"
 			done = 1
 		}
 		{ print }
 	' "$PREPARE" > "$tmp" || { rm -f "$tmp"; fail "awk failed on $PREPARE"; }
 	mv "$tmp" "$PREPARE" || { rm -f "$tmp"; fail "could not write $PREPARE"; }
-	grep -q 'modules-inst' "$PREPARE" \
-		|| fail "no bare 'jom -j%NUMBER_OF_PROCESSORS%' line in $PREPARE — upstream changed the Qt stage, re-check this patch"
+	grep -q 'for %%m in (qtbase' "$PREPARE" \
+		|| fail "no Qt 'jom -j%NUMBER_OF_PROCESSORS%' build line in $PREPARE — upstream changed the Qt stage, re-check this patch"
 	echo "patched: Qt mkspecs/modules-inst dirs pre-created (parallel qmake race)"
 fi
 
