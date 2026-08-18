@@ -71,9 +71,17 @@ jobs:
         run: |
           echo "CACHE_KEY=$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> $GITHUB_ENV
 
-          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win-x64.md
-          SDK="$(grep 'SDK version' $DOCPATH | sed -r 's/.*with \*\*(.*)\*\* SDK version.*/\1/')"
-          if [ -z "$SDK" ] || [ "$SDK" = "$(grep 'SDK version' $DOCPATH)" ]; then
+          # Glob rather than pin the filename: upstream renamed this doc
+          # building-win-x64.md -> building-win.md in 7.0.9 and the hardcoded
+          # path took the whole dependency build down with a bare grep ENOENT.
+          # A rename is not a reason to fail; a missing SDK line still is.
+          DOCPATH="$(ls "$TBUILD/$REPO_NAME"/docs/building-win*.md 2>/dev/null | head -n1)"
+          if [ -z "$DOCPATH" ]; then
+            echo "::error::No docs/building-win*.md in the checkout — cannot read the Windows SDK version."
+            exit 1
+          fi
+          SDK="$(grep 'SDK version' "$DOCPATH" | sed -r 's/.*with \*\*(.*)\*\* SDK version.*/\1/')"
+          if [ -z "$SDK" ] || [ "$SDK" = "$(grep 'SDK version' "$DOCPATH")" ]; then
             echo "::error::Could not parse the SDK version out of $DOCPATH."
             exit 1
           fi
