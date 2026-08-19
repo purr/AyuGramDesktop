@@ -219,4 +219,44 @@ else
 	fail "no d3dcompiler_47.dll entry in $SETUP — upstream reworked the installer, re-check this patch"
 fi
 
+# ---------------------------------------------------------------------------
+# 4. Cap how many cl.exe run at once.
+#
+# options_win.cmake compiles with a bare /MP, i.e. one cl.exe per core. Since
+# tdesktop 7.0.9 that no longer fits: the build cleared every dependency
+# project and then died 1h55m in with 16 x C1060 "compiler is out of heap
+# space", all in Telegram.vcxproj, on the heaviest translation units (the
+# generated qrc_emoji_*.cpp at 90k+ lines, ayu/libs/json.hpp,
+# window_main_menu.cpp). This is NOT the old 32-bit address-space limit:
+# build.yml sets PreferredToolArchitecture and the log shows HostX64\x64, so
+# it is genuine memory exhaustion on a 4-core runner.
+#
+# It has to be patched here rather than through MSBuild. /MP arrives as a raw
+# compile option in AdditionalOptions, so `/p:CL_MPCount=N` is inert: that
+# property only feeds ClCompile's ProcessorNumber, which MSBuild honours
+# solely when it owns MultiProcessorCompilation itself. Rewriting the flag is
+# the only lever that reaches cl.
+#
+# Windows-only in effect — this file is included for MSVC builds, so the patch
+# is inert on Linux and macOS. It lives in the cmake submodule, so as with
+# every other patch here nothing is committed to a tracked file.
+# ---------------------------------------------------------------------------
+
+OPTSWIN="cmake/options_win.cmake"
+[ -f "$OPTSWIN" ] || fail "$OPTSWIN not found - the cmake submodule is not checked out (clone with --recursive)"
+
+if grep -qE '^[[:space:]]*/MP[0-9]' "$OPTSWIN"; then
+	echo "skipped: MSVC compiler count already capped"
+elif grep -qE '^[[:space:]]*/MP([[:space:]]|$)' "$OPTSWIN"; then
+	# Two expressions rather than one \b: BSD sed has no word-boundary escape.
+	# Neither can rematch afterwards, since /MP2 is /MP followed by a digit.
+	sed_i 's|^\([[:space:]]*\)/MP\([[:space:]]\)|\1/MP2\2|' "$OPTSWIN"
+	sed_i 's|^\([[:space:]]*\)/MP$|\1/MP2|' "$OPTSWIN"
+	grep -qE '^[[:space:]]*/MP2' "$OPTSWIN" \
+		|| fail "could not cap /MP in $OPTSWIN"
+	echo "patched: MSVC compiler count capped (/MP -> /MP2, C1060 out-of-heap)"
+else
+	fail "no bare '/MP' flag in $OPTSWIN - upstream changed the MSVC options, re-check this patch"
+fi
+
 echo "ci-patch: done"
