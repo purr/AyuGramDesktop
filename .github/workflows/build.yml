@@ -354,6 +354,22 @@ jobs:
                fi ;;
           esac
 
+          # C1060 is commit exhaustion, not disk, so record what the box
+          # actually has. Nothing in three failed runs reported RAM or pagefile,
+          # which is why tuning /MP has been guesswork against wall-clock.
+          powershell -NoProfile -Command '
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $os = Get-CimInstance Win32_OperatingSystem
+            Write-Output ("RAM: {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB))
+            Write-Output ("Max commit: {0:N1} GB" -f ($os.TotalVirtualMemorySize/1MB))
+            Get-CimInstance Win32_PageFileUsage | ForEach-Object {
+              Write-Output ("Pagefile {0}: {1} MB allocated" -f $_.Name, $_.AllocatedBaseSize)
+            }
+            Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free } | ForEach-Object {
+              Write-Output ("Drive {0}: {1:N1} GB free" -f $_.Name, ($_.Free/1GB))
+            }
+          ' 2>/dev/null || true
+
       - name: AyuGram build.
         env:
           # MSBuild runs the 32-bit hosted cl.exe unless this says otherwise,

@@ -245,16 +245,30 @@ fi
 OPTSWIN="cmake/options_win.cmake"
 [ -f "$OPTSWIN" ] || fail "$OPTSWIN not found - the cmake submodule is not checked out (clone with --recursive)"
 
+# How many cl.exe may run at once. Overridable so this can be retuned from the
+# workflow without editing the patch logic.
+#
+# The escalation so far, all on the same 4-core runner: bare /MP gave 16 x
+# C1060; /MP2 cut that to 3, in the largest translation units (apiwrap.cpp and
+# friends); so the heaviest single TU still does not fit in half the box. 1
+# gives one compiler the whole machine, which costs wall-clock but is the only
+# setting with no concurrent peak at all. Disk is no longer the constraint --
+# the cleanup step in build.yml leaves 41.4 GB free and C1085 is gone.
+MP_COUNT="${CI_MSVC_MP:-1}"
+case "$MP_COUNT" in
+	''|*[!0-9]*|0) fail "CI_MSVC_MP must be a positive integer, got '$MP_COUNT'" ;;
+esac
+
 if grep -qE '^[[:space:]]*/MP[0-9]' "$OPTSWIN"; then
 	echo "skipped: MSVC compiler count already capped"
 elif grep -qE '^[[:space:]]*/MP([[:space:]]|$)' "$OPTSWIN"; then
 	# Two expressions rather than one \b: BSD sed has no word-boundary escape.
-	# Neither can rematch afterwards, since /MP2 is /MP followed by a digit.
-	sed_i 's|^\([[:space:]]*\)/MP\([[:space:]]\)|\1/MP2\2|' "$OPTSWIN"
-	sed_i 's|^\([[:space:]]*\)/MP$|\1/MP2|' "$OPTSWIN"
-	grep -qE '^[[:space:]]*/MP2' "$OPTSWIN" \
+	# Neither can rematch afterwards, since /MPn is /MP followed by a digit.
+	sed_i 's|^\([[:space:]]*\)/MP\([[:space:]]\)|\1/MP'"$MP_COUNT"'\2|' "$OPTSWIN"
+	sed_i 's|^\([[:space:]]*\)/MP$|\1/MP'"$MP_COUNT"'|' "$OPTSWIN"
+	grep -qE '^[[:space:]]*/MP[0-9]' "$OPTSWIN" \
 		|| fail "could not cap /MP in $OPTSWIN"
-	echo "patched: MSVC compiler count capped (/MP -> /MP2, C1060 out-of-heap)"
+	echo "patched: MSVC compiler count capped (/MP -> /MP$MP_COUNT, C1060 out-of-heap)"
 else
 	fail "no bare '/MP' flag in $OPTSWIN - upstream changed the MSVC options, re-check this patch"
 fi
