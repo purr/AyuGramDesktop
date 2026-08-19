@@ -299,6 +299,61 @@ jobs:
             ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-
             ${{ runner.os }}-x64-t1444-libs-
 
+      # The dependency job prunes its own tree before caching, but nothing
+      # reclaims the runner's preinstalled SDKs and the app build no longer
+      # fits: it ran 1h20m and then died with C1085 "No space left on device"
+      # writing .obj, after /MP2 had already cleared the earlier C1060. None of
+      # the paths below are reachable from an MSVC + Qt build. Sizes are logged
+      # either way, so the next shortfall is one glance instead of another
+      # 1h20m spent reproducing it.
+      - name: Free up some disk space.
+        shell: bash
+        run: |
+          avail() { df -k /c 2>/dev/null | awk 'NR==2 { printf "%.1f", $4/1048576 }'; }
+          BEFORE="$(avail)"
+          echo "C: free before cleanup: ${BEFORE} GB"
+
+          # Deliberately not touched: hostedtoolcache (prepare.py runs the
+          # runner's python), Strawberry Perl (openssl's configure needs it),
+          # and anything under Visual Studio.
+          for d in \
+            "/c/Android" \
+            "/c/Program Files (x86)/Android" \
+            "/c/Program Files/Microsoft SQL Server" \
+            "/c/Program Files (x86)/Microsoft SQL Server" \
+            "/c/Program Files/MongoDB" \
+            "/c/Program Files/MySQL" \
+            "/c/Program Files/PostgreSQL" \
+            "/c/Program Files/Amazon" \
+            "/c/Program Files/Microsoft SDKs/Azure" \
+            "/c/Program Files/Unity Hub" \
+            "/c/Julia" \
+            "/c/Rust" \
+            "/c/SeleniumWebDrivers" \
+            "/c/selenium" ; do
+            if [ -e "$d" ]; then
+              SZ=$(du -sm "$d" 2>/dev/null | cut -f1 || echo '?')
+              rm -rf "$d" 2>/dev/null || true
+              echo "  removed ${d} (${SZ} MB)"
+            fi
+          done
+
+          if command -v docker >/dev/null 2>&1; then
+            docker system prune -af >/dev/null 2>&1 || true
+            echo "  pruned docker images"
+          fi
+
+          AFTER="$(avail)"
+          echo "C: free after cleanup:  ${AFTER} GB"
+          # Not a hard gate: this is advisory, and a build that fits in less
+          # should not be blocked by a threshold guessed from one data point.
+          case "$AFTER" in
+            ''|*[!0-9.]*) ;;
+            *) if [ "${AFTER%.*}" -lt 25 ]; then
+                 echo "::warning::Only ${AFTER} GB free on C: — the app build previously ran out of disk. Expect C1085."
+               fi ;;
+          esac
+
       - name: AyuGram build.
         env:
           # MSBuild runs the 32-bit hosted cl.exe unless this says otherwise,
