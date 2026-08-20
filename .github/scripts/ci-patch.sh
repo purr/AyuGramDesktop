@@ -273,4 +273,99 @@ else
 	fail "no bare '/MP' flag in $OPTSWIN - upstream changed the MSVC options, re-check this patch"
 fi
 
+# ---------------------------------------------------------------------------
+# 5. Point "get the update" at OUR releases.
+#
+# Autoupdate is compiled out, and tdesktop already handles that case: when
+# UpdaterDisabled() is true it stops trying to self-update and just opens a
+# download page instead (update_checker.cpp, UpdateApplication). AyuGram points
+# that page, and the "Update AyuGram" button shown on messages too new for the
+# running build, at their own release channel. Ours are not their builds, so
+# send users somewhere that actually has the binary they are running.
+#
+# This is the whole of our update story by design: no signing key, no silent
+# background rewrite of the installed files, no Updater.exe. The user clicks a
+# link, downloads the installer, and runs it -- and the installer upgrades in
+# place without touching tdata (see section 6).
+#
+# Deliberately NOT the /releases/latest URL: the rolling 'continuous' release
+# can be flagged prerelease, and /latest then 404s or silently serves an older
+# tag. The plain list always shows the newest first.
+# ---------------------------------------------------------------------------
+
+RELEASES_URL="${CI_RELEASES_URL:-https://github.com/purr/AyuGramDesktop/releases}"
+UPDATE_LINK_FILES="Telegram/SourceFiles/core/update_checker.cpp Telegram/SourceFiles/history/history_item_helpers.cpp"
+
+for f in $UPDATE_LINK_FILES; do
+	[ -f "$f" ] || fail "$f not found - wrong root?"
+done
+
+STALE=0
+for f in $UPDATE_LINK_FILES; do
+	n=$(grep -c 'https://t\.me/AyuGramReleases' "$f" || true)
+	STALE=$((STALE + n))
+done
+
+if [ "$STALE" -gt 0 ]; then
+	for f in $UPDATE_LINK_FILES; do
+		sed_i "s|https://t\.me/AyuGramReleases|$RELEASES_URL|g" "$f"
+	done
+	for f in $UPDATE_LINK_FILES; do
+		if grep -q 'https://t\.me/AyuGramReleases' "$f"; then
+			fail "could not repoint the update links in $f"
+		fi
+	done
+	echo "patched: $STALE update link(s) -> $RELEASES_URL"
+else
+	OURS=0
+	for f in $UPDATE_LINK_FILES; do
+		if grep -qF "$RELEASES_URL" "$f"; then
+			OURS=1
+		fi
+	done
+	if [ "$OURS" -eq 1 ]; then
+		echo "skipped: update links already point at our releases"
+	else
+		fail "no AyuGramReleases link in $UPDATE_LINK_FILES - upstream changed the update links, re-check this patch"
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Drop a stale Updater.exe on upgrade.
+#
+# Section 3 removes Updater.exe from [Files] because DESKTOP_APP_DISABLE_AUTOUPDATE
+# never builds it. But installing over an OFFICIAL AyuGram install leaves theirs
+# behind: [Files] only overwrites what it ships, so an unlisted binary survives.
+# It is inert in our builds -- nothing invokes it -- but a stray updater sitting
+# in the install directory is exactly the kind of thing this fork exists to not
+# have. [InstallDelete] runs before the files are copied, on every install.
+#
+# Only {app}\Updater.exe is touched. Nothing here goes near tdata: user data is
+# not in [Files] and so is never rewritten by an upgrade, and the [UninstallDelete]
+# list that DOES name tdata only runs on uninstall.
+# ---------------------------------------------------------------------------
+
+if grep -q '^\[InstallDelete\]' "$SETUP"; then
+	echo "skipped: stale Updater.exe already cleaned on upgrade"
+elif grep -q '^\[Icons\]' "$SETUP"; then
+	tmp="$(mktemp "$SETUP.ci-patch.XXXXXX")" || fail "mktemp failed next to $SETUP"
+	awk '
+		/^\[Icons\]/ && !done {
+			print "[InstallDelete]"
+			print "; ci-patch: autoupdate is compiled out, so a Updater.exe left by an"
+			print "; official AyuGram install would just sit there unused."
+			print "Type: files; Name: \"{app}\\Updater.exe\""
+			print ""
+			done = 1
+		}
+		{ print }
+	' "$SETUP" > "$tmp" || { rm -f "$tmp"; fail "awk failed on $SETUP"; }
+	mv "$tmp" "$SETUP" || { rm -f "$tmp"; fail "could not write $SETUP"; }
+	grep -q '^\[InstallDelete\]' "$SETUP" \
+		|| fail "could not add [InstallDelete] to $SETUP"
+	echo "patched: stale Updater.exe removed on upgrade"
+else
+	fail "no [Icons] section in $SETUP - upstream reworked the installer, re-check this patch"
+fi
+
 echo "ci-patch: done"

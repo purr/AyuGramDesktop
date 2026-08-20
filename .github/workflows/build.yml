@@ -399,9 +399,9 @@ jobs:
           rem 4-core, 16 GB runner.
           rem
           rem /MP alone was still too much as of tdesktop 7.0.9 — one cl.exe per
-          rem core exhausted RAM and died with C1060. ci-patch.sh caps it to /MP2
-          rem in the cmake submodule; see section 4 there for why MSBuild cannot
-          rem do it. Keep this build call plain.
+          rem core exhausted RAM and died with C1060. ci-patch.sh caps it via
+          rem CI_MSVC_MP in the cmake submodule; see section 4 there for why MSBuild
+          rem cannot do it. Keep this build call plain.
           cmake --build ..\out --config Release
           if %errorlevel% neq 0 exit /b %errorlevel%
 
