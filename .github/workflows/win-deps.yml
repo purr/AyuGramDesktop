@@ -47,11 +47,27 @@ jobs:
         shell: cmd
 
     steps:
+      # Same drive choice as the app build in build.yml, for the same reason:
+      # windows-latest images differ by more free space on C: than this build
+      # has margin, and D: carries 3.5-5x the headroom. This job has not run out
+      # of disk yet only because it has been restoring a warm cache in minutes;
+      # a cold Libraries build writes far more than the app build does, so it
+      # would hit the wall harder. See build.yml 'Prepare directories.' for the
+      # two measured runs. Falls back to the profile when D: is missing or no
+      # roomier than C:.
       - name: Prepare directories.
         run: |
-          mkdir %userprofile%\TBuild\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          set "TBROOT=%userprofile%\TBuild"
+          for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "$c=(Get-PSDrive C -ErrorAction SilentlyContinue).Free; $d=(Get-PSDrive D -ErrorAction SilentlyContinue).Free; if ($d -gt $c) { 'D:\TBuild' }"`) do set "TBROOT=%%d"
+          echo Build tree root: %TBROOT%
+
+          mkdir "%TBROOT%\Libraries"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          mklink /d %GITHUB_WORKSPACE%\TBuild "%TBROOT%"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
           echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo TBUILD_ROOT=%TBROOT%>>%GITHUB_ENV%
           echo REPO_NAME=${{ github.event.repository.name }}>>%GITHUB_ENV%
 
       - name: Clone.

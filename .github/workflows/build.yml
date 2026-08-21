@@ -225,11 +225,41 @@ jobs:
         shell: cmd
 
     steps:
+      # Put the build tree on whichever drive has room, rather than always on
+      # C:. windows-latest hands out more than one image and they straddle what
+      # this build needs:
+      #
+      #   run 32311528367  C: 41.3 GB free  D: 147.0 GB  pagefile on D:  passed
+      #   run 32359941744  C: 38.6 GB free  D: 219.9 GB  pagefile on C:  C1085
+      #
+      # Same cleanup (12.5 vs 12.6 GB reclaimed), same /MP1, and no C1060 in
+      # either — so this is not the memory problem coming back. The app build
+      # needs between 38.6 and 41.3 GB, and which image the run lands on is
+      # what decides it. D: is the VM's temp disk and carries 3.5-5x the
+      # headroom in both images, so build there and stop gambling on C:.
+      #
+      # TBuild stays symlinked into the workspace because actions/checkout
+      # refuses a 'path:' outside GITHUB_WORKSPACE. Only the link target moves,
+      # so every later step still goes through %TBUILD% and needs no change.
+      # Falls back to the profile whenever D: is missing or no roomier than C:,
+      # which is also what keeps this correct if the images change again.
       - name: Prepare directories.
         run: |
-          mkdir %userprofile%\TBuild\Libraries
-          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          set "TBROOT=%userprofile%\TBuild"
+          for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "$c=(Get-PSDrive C -ErrorAction SilentlyContinue).Free; $d=(Get-PSDrive D -ErrorAction SilentlyContinue).Free; if ($d -gt $c) { 'D:\TBuild' }"`) do set "TBROOT=%%d"
+          echo Build tree root: %TBROOT%
+
+          rem The original step checked neither of these, so a failure here only
+          rem surfaced later as a confusing Clone error.
+          mkdir "%TBROOT%\Libraries"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          mklink /d %GITHUB_WORKSPACE%\TBuild "%TBROOT%"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
           echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          rem The unresolved target, so the cleanup step can measure the drive
+          rem the tree is really on instead of assuming C:.
+          echo TBUILD_ROOT=%TBROOT%>>%GITHUB_ENV%
           echo REPO_NAME=${{ github.event.repository.name }}>>%GITHUB_ENV%
 
       - name: Clone.
@@ -309,8 +339,16 @@ jobs:
       - name: Free up some disk space.
         shell: bash
         run: |
-          avail() { df -k /c 2>/dev/null | awk 'NR==2 { printf "%.1f", $4/1048576 }'; }
-          BEFORE="$(avail)"
+          avail() { df -k "$1" 2>/dev/null | awk 'NR==2 { printf "%.1f", $4/1048576 }'; }
+
+          # The tree may be on D: now, so the drive to watch is whichever one
+          # 'Prepare directories.' picked. Everything reclaimed below is still
+          # on C: — that is where the preinstalled SDKs, %TEMP% and the pagefile
+          # live — so C: is worth freeing and reporting either way.
+          BUILD_ROOT="${TBUILD_ROOT:-C:\\Users\\runneradmin\\TBuild}"
+          BUILD_DRIVE="$(printf '%s' "$BUILD_ROOT" | cut -c1 | tr 'A-Z' 'a-z')"
+
+          BEFORE="$(avail /c)"
           echo "C: free before cleanup: ${BEFORE} GB"
 
           # Deliberately not touched: hostedtoolcache (prepare.py runs the
@@ -343,14 +381,20 @@ jobs:
             echo "  pruned docker images"
           fi
 
-          AFTER="$(avail)"
+          AFTER="$(avail /c)"
           echo "C: free after cleanup:  ${AFTER} GB"
-          # Not a hard gate: this is advisory, and a build that fits in less
-          # should not be blocked by a threshold guessed from one data point.
-          case "$AFTER" in
+
+          BUILD_FREE="$(avail "/${BUILD_DRIVE}")"
+          echo "build tree: ${BUILD_ROOT} ($(printf '%s' "$BUILD_DRIVE" | tr 'a-z' 'A-Z'): ${BUILD_FREE} GB free)"
+
+          # Threshold is measured, not guessed: 38.6 GB gave C1085 in run
+          # 32359941744 and 41.3 GB was enough in 32311528367, so the real
+          # figure sits between them and 45 leaves a little margin. Advisory
+          # only — a build that fits in less must not be blocked by it.
+          case "$BUILD_FREE" in
             ''|*[!0-9.]*) ;;
-            *) if [ "${AFTER%.*}" -lt 25 ]; then
-                 echo "::warning::Only ${AFTER} GB free on C: — the app build previously ran out of disk. Expect C1085."
+            *) if [ "${BUILD_FREE%.*}" -lt 45 ]; then
+                 echo "::warning::Only ${BUILD_FREE} GB free on the build drive — 38.6 GB was not enough in run 32359941744. Expect C1085."
                fi ;;
           esac
 
