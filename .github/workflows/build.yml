@@ -1,0 +1,1058 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - dev
+    tags:
+      - 'v*'
+    # paths-ignore does not honour '!' re-inclusion, so this is a single
+    # `paths` filter instead. Later patterns win. (Not evaluated for tag pushes.)
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**.md'
+      - '!changelog.txt'
+      - '!LEGAL'
+      - '!LICENSE'
+      - '!.github/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      only_cache:
+        description: 'Build dependencies only, bank the caches, skip the app build'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish a release'
+        type: boolean
+        default: true
+      force:
+        description: 'Rebuild even if this commit was already built'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # The run_id suffix keeps a cache-priming run from being cancelled by an
+  # unrelated push to the same branch.
+  group: build-${{ github.ref }}-${{ inputs.only_cache && github.run_id || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  ONLY_CACHE: ${{ inputs.only_cache && 'true' || 'false' }}
+  # The repo publishes the official Telegram Desktop keys in docs/api_credentials.md.
+  # Set TELEGRAM_API_ID / TELEGRAM_API_HASH as repository secrets to use your own.
+  API_ID: ${{ secrets.TELEGRAM_API_ID || '2040' }}
+  API_HASH: ${{ secrets.TELEGRAM_API_HASH || 'b18441a1ff607e10a989891a5462e627' }}
+
+jobs:
+
+  # Runs first and costs seconds. Every release records the commit it was built
+  # from, so this can tell whether this exact commit already has binaries and
+  # avoid spending hours reproducing them.
+  #
+  # Two cases it catches. Pushing dev and then a v* tag builds the SAME commit
+  # twice — the tag run reuses the binaries the dev run already made. And
+  # re-pushing an already-built commit does nothing at all.
+  #
+  # Reuse keys on the commit, which covers the whole tree including this file and
+  # ci-patch.sh, so a change to either yields a new sha and cannot reuse. It does
+  # NOT cover secrets: setting or rotating TELEGRAM_API_ID/HASH changes the build
+  # output at a fixed sha. After doing that, dispatch once with force=true.
+  guard:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      # A tag whose release already holds binaries for this commit, or ''.
+      reuse_from: ${{ steps.check.outputs.reuse_from }}
+      # 'true' when the release we would publish already has this commit.
+      skip: ${{ steps.check.outputs.skip }}
+
+    steps:
+      - name: Look for an existing build of this commit.
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # only_cache runs exist to bank dependency caches, and their app build
+          # and release are already gated off elsewhere. Whether this commit has
+          # binaries somewhere is irrelevant to that, so never gate them here.
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ inputs.only_cache }}" = "true" ]; then
+            echo "force or only_cache requested — building regardless."
+            echo "reuse_from=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            TARGET="${GITHUB_REF#refs/tags/}"
+          else
+            TARGET="continuous"
+          fi
+          echo "This run would publish: $TARGET"
+
+          # The marker the release job writes into every release body.
+          MARKER="Built by GitHub Actions from \`${{ github.sha }}\`"
+
+          # macOS is continue-on-error by design, so its absence proves nothing.
+          # These do. Listing the installers too means a release published before
+          # they existed counts as incomplete and gets rebuilt, rather than being
+          # copied forward with half its assets missing.
+          REQUIRED="AyuGram-windows-x64.zip AyuGram-windows-x64-setup.exe AyuGram-linux-x64.tar.gz AyuGram-linux-x64.AppImage"
+
+          FOUND=""
+          # $TARGET first, by name: 'gh release list' is newest-first by CREATION
+          # date and a rolling release's creation date never moves, so
+          # 'continuous' falls off the list once 30 newer tags exist. Checking it
+          # first also makes skip win over reuse when both carry the sha.
+          for tag in "$TARGET" $(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --json tagName --jq '.[].tagName' 2>/dev/null || true); do
+            REL=$(gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json body,assets 2>/dev/null || true)
+            [ -n "$REL" ] || continue
+
+            case "$(printf '%s' "$REL" | jq -r '.body')" in
+              *"$MARKER"*) ;;
+              *) continue ;;
+            esac
+
+            # The marker only proves a run reached the publish step — the release
+            # job publishes when EITHER platform succeeded. Treating a partial
+            # release as "already built" would skip the rebuild of the platform
+            # that failed, and hand back a green run with a binary missing.
+            MISSING=""
+            for want in $REQUIRED; do
+              printf '%s' "$REL" | jq -e --arg n "$want" 'any(.assets[]; .name == $n)' >/dev/null 2>&1 \
+                || MISSING="$MISSING $want"
+            done
+            if [ -n "$MISSING" ]; then
+              echo "::notice::'$tag' has this commit but is missing:$MISSING — it came from a partially failed run. Building."
+              continue
+            fi
+
+            FOUND="$tag"; break
+          done
+
+          if [ -z "$FOUND" ]; then
+            echo "No release was built from ${{ github.sha }} — building."
+            echo "reuse_from=" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$FOUND" = "$TARGET" ]; then
+            echo "::notice::$TARGET was already built from this exact commit. Nothing to do — skipping the whole run. Re-run with 'force' to rebuild anyway."
+            echo "reuse_from=" >> "$GITHUB_OUTPUT"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Release '$FOUND' already holds binaries for this commit. Copying them to '$TARGET' instead of rebuilding — saves hours."
+            echo "reuse_from=$FOUND" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # A cold dependency build can outrun GitHub's 6h cap, and the cap is per JOB,
+  # not per run. So chain attempts: each call gets its own fresh 6h window and
+  # picks up where the last stopped, which continues a cold bootstrap without a
+  # human pressing Re-run. prepare.py checkpoints per stage, so a call that
+  # inherits a finished tree just skips everything and returns in minutes.
+  #
+  # Each link only runs if the one before it ran out of time. A genuine build
+  # error fails its job, which stops the chain instead of burning 5h retrying.
+  deps1:
+    name: Dependencies
+    needs: guard
+    if: needs.guard.outputs.skip != 'true' && needs.guard.outputs.reuse_from == ''
+    uses: ./.github/workflows/win-deps.yml
+    with:
+      attempt: 1
+
+  deps2:
+    name: Dependencies
+    needs: deps1
+    if: needs.deps1.outputs.done != 'true'
+    uses: ./.github/workflows/win-deps.yml
+    with:
+      attempt: 2
+
+  deps3:
+    name: Dependencies
+    needs: deps2
+    if: needs.deps2.outputs.done != 'true'
+    uses: ./.github/workflows/win-deps.yml
+    with:
+      attempt: 3
+
+  # Three attempts (~15h of building) did not finish. Fail loudly rather than
+  # let the run go green with the Windows build silently skipped.
+  deps_exhausted:
+    name: Dependencies exhausted
+    needs: [deps1, deps2, deps3]
+    if: |
+      always()
+      && !cancelled()
+      && needs.deps1.outputs.done != 'true'
+      && needs.deps2.outputs.done != 'true'
+      && needs.deps3.outputs.done != 'true'
+      && needs.deps3.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - shell: bash
+        run: |
+          echo "::error::Dependencies still unfinished after three chained attempts. Everything built so far IS cached, so starting a new run continues from here — but three 5h attempts failing to converge usually means one single stage cannot fit in the time box, which re-running will never fix."
+          exit 1
+
+  windows:
+    name: Windows x64
+    needs: [deps1, deps2, deps3]
+    # Runs as soon as ANY link in the chain reports a complete tree. The later
+    # links are skipped in that case, and a skipped job's outputs are empty, so
+    # this must test for 'true' rather than for absence.
+    if: |
+      always()
+      && !cancelled()
+      && inputs.only_cache != true
+      && (needs.deps1.outputs.done == 'true'
+          || needs.deps2.outputs.done == 'true'
+          || needs.deps3.outputs.done == 'true')
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    env:
+      PREPARE_PATH: 'Telegram/build/prepare/prepare.py'
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      # Put the build tree on whichever drive has room, rather than always on
+      # C:. windows-latest hands out more than one image and they straddle what
+      # this build needs:
+      #
+      #   run 32311528367  C: 41.3 GB free  D: 147.0 GB  pagefile on D:  passed
+      #   run 32359941744  C: 38.6 GB free  D: 219.9 GB  pagefile on C:  C1085
+      #
+      # Same cleanup (12.5 vs 12.6 GB reclaimed), same /MP1, and no C1060 in
+      # either — so this is not the memory problem coming back. The app build
+      # needs between 38.6 and 41.3 GB, and which image the run lands on is
+      # what decides it. D: is the VM's temp disk and carries 3.5-5x the
+      # headroom in both images, so build there and stop gambling on C:.
+      #
+      # TBuild stays symlinked into the workspace because actions/checkout
+      # refuses a 'path:' outside GITHUB_WORKSPACE. Only the link target moves,
+      # so every later step still goes through %TBUILD% and needs no change.
+      # Falls back to the profile whenever D: is missing or no roomier than C:,
+      # which is also what keeps this correct if the images change again.
+      - name: Prepare directories.
+        run: |
+          set "TBROOT=%userprofile%\TBuild"
+          for /f "usebackq delims=" %%d in (`powershell -NoProfile -Command "$c=(Get-PSDrive C -ErrorAction SilentlyContinue).Free; $d=(Get-PSDrive D -ErrorAction SilentlyContinue).Free; if ($d -gt $c) { 'D:\TBuild' }"`) do set "TBROOT=%%d"
+          echo Build tree root: %TBROOT%
+
+          rem The original step checked neither of these, so a failure here only
+          rem surfaced later as a confusing Clone error.
+          mkdir "%TBROOT%\Libraries"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+          mklink /d %GITHUB_WORKSPACE%\TBuild "%TBROOT%"
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          rem The unresolved target, so the cleanup step can measure the drive
+          rem the tree is really on instead of assuming C:.
+          echo TBUILD_ROOT=%TBROOT%>>%GITHUB_ENV%
+          echo REPO_NAME=${{ github.event.repository.name }}>>%GITHUB_ENV%
+
+      - name: Clone.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ github.event.repository.name }}
+
+      # Must match windows_deps exactly, or CACHE_KEY diverges and this job
+      # misses the cache windows_deps just spent hours filling.
+      - name: Apply CI patches.
+        shell: bash
+        run: bash "$TBUILD/$REPO_NAME/.github/scripts/ci-patch.sh" "$TBUILD/$REPO_NAME"
+
+      - name: First set up.
+        shell: bash
+        run: |
+          echo "CACHE_KEY=$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          # Glob rather than pin the filename: upstream renamed this doc
+          # building-win-x64.md -> building-win.md in 7.0.9 and the hardcoded
+          # path took the whole dependency build down with a bare grep ENOENT.
+          # A rename is not a reason to fail; a missing SDK line still is.
+          DOCPATH="$(ls "$TBUILD/$REPO_NAME"/docs/building-win*.md 2>/dev/null | head -n1)"
+          if [ -z "$DOCPATH" ]; then
+            echo "::error::No docs/building-win*.md in the checkout — cannot read the Windows SDK version."
+            exit 1
+          fi
+          SDK="$(grep 'SDK version' "$DOCPATH" | sed -r 's/.*with \*\*(.*)\*\* SDK version.*/\1/')"
+          # Fail loudly rather than hand msvc-dev-cmd an empty 'sdk:', which
+          # silently selects the image default and yields a mismatched build.
+          if [ -z "$SDK" ] || [ "$SDK" = "$(grep 'SDK version' "$DOCPATH")" ]; then
+            echo "::error::Could not parse the SDK version out of $DOCPATH."
+            exit 1
+          fi
+          echo "Windows SDK: $SDK"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+      - name: Native Tools Command Prompt.
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          # Pin the toolset. The runner's VS 2026 image defaults to MSVC 14.51,
+          # but the app is linked with v143 (14.44); building the deps with 14.51
+          # emits __std_* STL helpers that 14.44's link libs lack -> LNK2019.
+          toolset: '14.44'
+
+      # Restore only — windows_deps owns writing these. The primary key cannot
+      # match (no run_id/run_attempt suffix), so it always falls through to the
+      # prefix and picks up the newest tree windows_deps banked.
+      - name: Restore ThirdParty cache.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-x64-t1444-third-party-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-third-party-
+
+      - name: Restore Libraries cache.
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.TBUILD }}\Libraries
+          key: ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}
+          restore-keys: |
+            ${{ runner.os }}-x64-t1444-libs-${{ env.CACHE_KEY }}-
+            ${{ runner.os }}-x64-t1444-libs-
+
+      # The dependency job prunes its own tree before caching, but nothing
+      # reclaims the runner's preinstalled SDKs and the app build no longer
+      # fits: it ran 1h20m and then died with C1085 "No space left on device"
+      # writing .obj, after /MP2 had already cleared the earlier C1060. None of
+      # the paths below are reachable from an MSVC + Qt build. Sizes are logged
+      # either way, so the next shortfall is one glance instead of another
+      # 1h20m spent reproducing it.
+      - name: Free up some disk space.
+        shell: bash
+        run: |
+          avail() { df -k "$1" 2>/dev/null | awk 'NR==2 { printf "%.1f", $4/1048576 }'; }
+
+          # The tree may be on D: now, so the drive to watch is whichever one
+          # 'Prepare directories.' picked. Everything reclaimed below is still
+          # on C: — that is where the preinstalled SDKs, %TEMP% and the pagefile
+          # live — so C: is worth freeing and reporting either way.
+          BUILD_ROOT="${TBUILD_ROOT:-C:\\Users\\runneradmin\\TBuild}"
+          BUILD_DRIVE="$(printf '%s' "$BUILD_ROOT" | cut -c1 | tr 'A-Z' 'a-z')"
+
+          BEFORE="$(avail /c)"
+          echo "C: free before cleanup: ${BEFORE} GB"
+
+          # Deliberately not touched: hostedtoolcache (prepare.py runs the
+          # runner's python), Strawberry Perl (openssl's configure needs it),
+          # and anything under Visual Studio.
+          for d in \
+            "/c/Android" \
+            "/c/Program Files (x86)/Android" \
+            "/c/Program Files/Microsoft SQL Server" \
+            "/c/Program Files (x86)/Microsoft SQL Server" \
+            "/c/Program Files/MongoDB" \
+            "/c/Program Files/MySQL" \
+            "/c/Program Files/PostgreSQL" \
+            "/c/Program Files/Amazon" \
+            "/c/Program Files/Microsoft SDKs/Azure" \
+            "/c/Program Files/Unity Hub" \
+            "/c/Julia" \
+            "/c/Rust" \
+            "/c/SeleniumWebDrivers" \
+            "/c/selenium" ; do
+            if [ -e "$d" ]; then
+              SZ=$(du -sm "$d" 2>/dev/null | cut -f1 || echo '?')
+              rm -rf "$d" 2>/dev/null || true
+              echo "  removed ${d} (${SZ} MB)"
+            fi
+          done
+
+          if command -v docker >/dev/null 2>&1; then
+            docker system prune -af >/dev/null 2>&1 || true
+            echo "  pruned docker images"
+          fi
+
+          AFTER="$(avail /c)"
+          echo "C: free after cleanup:  ${AFTER} GB"
+
+          BUILD_FREE="$(avail "/${BUILD_DRIVE}")"
+          echo "build tree: ${BUILD_ROOT} ($(printf '%s' "$BUILD_DRIVE" | tr 'a-z' 'A-Z'): ${BUILD_FREE} GB free)"
+
+          # Threshold is measured, not guessed: 38.6 GB gave C1085 in run
+          # 32359941744 and 41.3 GB was enough in 32311528367, so the real
+          # figure sits between them and 45 leaves a little margin. Advisory
+          # only — a build that fits in less must not be blocked by it.
+          case "$BUILD_FREE" in
+            ''|*[!0-9.]*) ;;
+            *) if [ "${BUILD_FREE%.*}" -lt 45 ]; then
+                 echo "::warning::Only ${BUILD_FREE} GB free on the build drive — 38.6 GB was not enough in run 32359941744. Expect C1085."
+               fi ;;
+          esac
+
+          # C1060 is commit exhaustion, not disk, so record what the box
+          # actually has. Nothing in three failed runs reported RAM or pagefile,
+          # which is why tuning /MP has been guesswork against wall-clock.
+          powershell -NoProfile -Command '
+            $cs = Get-CimInstance Win32_ComputerSystem
+            $os = Get-CimInstance Win32_OperatingSystem
+            Write-Output ("RAM: {0:N1} GB" -f ($cs.TotalPhysicalMemory/1GB))
+            Write-Output ("Max commit: {0:N1} GB" -f ($os.TotalVirtualMemorySize/1MB))
+            Get-CimInstance Win32_PageFileUsage | ForEach-Object {
+              Write-Output ("Pagefile {0}: {1} MB allocated" -f $_.Name, $_.AllocatedBaseSize)
+            }
+            Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free } | ForEach-Object {
+              Write-Output ("Drive {0}: {1:N1} GB free" -f $_.Name, ($_.Free/1GB))
+            }
+          ' 2>/dev/null || true
+
+      - name: AyuGram build.
+        env:
+          # MSBuild runs the 32-bit hosted cl.exe unless this says otherwise,
+          # and a 32-bit compiler has ~4 GB of address space to work in. The
+          # largest translation units here — mainwidget.cpp, and the generated
+          # qrc_emoji_*.cpp, one of which is 90k+ lines — exhaust that and die
+          # with C1060 "compiler is out of heap space". The 64-bit host has the
+          # same toolset version and emits the same x64 code; it simply has
+          # room. CMake's own '-T host=x64' is not available to us: run_cmake.py
+          # hard-codes '-T v143', and cmake rejects a second -T.
+          PreferredToolArchitecture: x64
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat x64 ^
+          -D TDESKTOP_API_ID=%API_ID% ^
+          -D TDESKTOP_API_HASH=%API_HASH% ^
+          -D CMAKE_CONFIGURATION_TYPES=Release ^
+          -D CMAKE_MSVC_DEBUG_INFORMATION_FORMAT= ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+          rem No --parallel. It would hand MSBuild an unbounded /m, and
+          rem cmake/options_win.cmake already compiles every target with /MP,
+          rem so the two multiply: up to cores-squared concurrent cl.exe on a
+          rem 4-core, 16 GB runner.
+          rem
+          rem /MP alone was still too much as of tdesktop 7.0.9 — one cl.exe per
+          rem core exhausted RAM and died with C1060. ci-patch.sh caps it via
+          rem CI_MSVC_MP in the cmake submodule; see section 4 there for why MSBuild
+          rem cannot do it. Keep this build call plain.
+          cmake --build ..\out --config Release
+          if %errorlevel% neq 0 exit /b %errorlevel%
+
+      - name: Package.
+        shell: bash
+        run: |
+          OUT="$TBUILD/$REPO_NAME/out/Release"
+          if [ ! -f "$OUT/AyuGram.exe" ]; then
+            echo "::error::AyuGram.exe not found in $OUT"
+            ls -la "$OUT" || true
+            exit 1
+          fi
+
+          mkdir -p package
+          cp "$OUT/AyuGram.exe" package/
+
+          # Qt5 is the Windows default (Telegram/build/qt_version.py), which means
+          # ANGLE, which loads this at runtime. Not always emitted, so don't insist.
+          DLL="$OUT/modules/x64/d3d/d3dcompiler_47.dll"
+          if [ -f "$DLL" ]; then
+            mkdir -p package/modules/x64/d3d
+            cp "$DLL" package/modules/x64/d3d/
+          else
+            echo "::warning::d3dcompiler_47.dll was not produced; the app will fall back to the system copy."
+          fi
+
+          cd package
+          7z a -tzip ../AyuGram-windows-x64.zip .
+
+      # The zip above is the portable build; this is the ordinary Windows way to
+      # install one. ci-patch.sh has already reconciled setup.iss with what this
+      # job actually produces — AyuGram.exe, no Updater.exe, no code signing.
+      #
+      # Never fatal. The zip is the deliverable and it already exists by now;
+      # losing it because a convenience artifact failed would be a straight
+      # regression. The ::error:: annotations below still surface the failure,
+      # and the guard's REQUIRED list makes the next run rebuild rather than
+      # reuse a release that came out short.
+      - name: Installer.
+        shell: bash
+        continue-on-error: true
+        run: |
+          BUILD="$TBUILD/$REPO_NAME/Telegram/build"
+          OUT="$TBUILD/$REPO_NAME/out/Release"
+
+          # The same defines build.bat passes, read from the same file it reads.
+          # AppVersionStrFull only differs from AppVersionStr on alpha and beta
+          # builds, which CI never produces.
+          VER_SMALL=$(awk '$1 == "AppVersionStrSmall" { print $2 }' "$BUILD/version")
+          VER_FULL=$(awk '$1 == "AppVersionStr" { print $2 }' "$BUILD/version")
+          [ -n "$VER_SMALL" ] && [ -n "$VER_FULL" ] \
+            || { echo "::error::Could not read the version out of $BUILD/version"; exit 1; }
+
+          ISCC='C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if [ ! -f "$ISCC" ]; then
+            ISCC=$(command -v iscc) \
+              || { echo "::error::Inno Setup not found on the runner"; exit 1; }
+          fi
+
+          # ISCC is a native Windows program, so every path it is handed has to
+          # be a Windows path rather than the MSYS one bash uses here — hence
+          # cygpath -w.
+          #
+          # MSYS2_ARG_CONV_EXCL is the other half, and it is not optional: when
+          # bash execs a native exe, the MSYS runtime rewrites any argument that
+          # looks like a rooted POSIX path. '/dMyAppVersion=6.7.8' becomes
+          # 'C:/Program Files/Git/dMyAppVersion=6.7.8', which no longer starts
+          # with '/' or '-', so ISCC reads it as a second script filename and
+          # dies with "You may not specify more than one script filename."
+          # Every path here is already Windows-form, so no argument on this line
+          # wants converting. '*' turns the whole heuristic off.
+          MSYS2_ARG_CONV_EXCL='*' "$ISCC" \
+            /dMyAppVersion="$VER_SMALL" \
+            /dMyAppVersionFull="$VER_FULL" \
+            /dMyBuildTarget=win64 \
+            /dReleasePath="$(cygpath -w "$OUT")" \
+            "$(cygpath -w "$BUILD/setup.iss")"
+
+          # setup.iss writes to OutputDir={#ReleasePath}. Rename it to a fixed
+          # asset name: with the version in the filename, the rolling
+          # 'continuous' release would keep one installer per app version for
+          # ever, since assets are only replaced when the name matches.
+          SETUP="$OUT/ayusetup-x64.$VER_FULL.exe"
+          [ -f "$SETUP" ] || { echo "::error::ISCC reported success but $SETUP is missing"; ls -la "$OUT"; exit 1; }
+          mv "$SETUP" AyuGram-windows-x64-setup.exe
+
+      - name: Upload portable artifact.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: AyuGram-windows-x64
+          path: AyuGram-windows-x64.zip
+          if-no-files-found: error
+
+      # Never fatal: mirrors the Installer step above — a missing installer
+      # must not fail the job, so this step cannot use if-no-files-found: error.
+      - name: Upload installer artifact.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: AyuGram-windows-x64-setup
+          path: AyuGram-windows-x64-setup.exe
+          if-no-files-found: warn
+
+  linux:
+    name: Linux x64
+    needs: guard
+    if: needs.guard.outputs.skip != 'true' && needs.guard.outputs.reuse_from == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    env:
+      IMAGE_TAG: tdesktop:centos_env
+
+    steps:
+      - name: Clone.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+
+      - name: Apply CI patches.
+        run: bash .github/scripts/ci-patch.sh .
+
+      - name: Free up some disk space.
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+
+      - name: First set up.
+        run: |
+          sudo apt update
+          curl -sSL https://install.python-poetry.org | python3 -
+          cd Telegram/build/docker/centos_env
+          poetry install
+          DOCKERFILE=$(DEBUG= LTO= poetry run gen_dockerfile)
+          echo "$DOCKERFILE" > Dockerfile
+          rm -rf __pycache__
+
+      - name: Set up Docker Buildx.
+        uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Libraries cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/.buildx-cache
+          key: ${{ runner.os }}-libs-${{ hashFiles('Telegram/build/docker/centos_env/**') }}
+          restore-keys: ${{ runner.os }}-libs-
+
+      - name: Libraries.
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        env:
+          # Don't upload the build-record artifact — we don't use it, and its
+          # flaky download was failing the release job.
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: Telegram/build/docker/centos_env
+          load: ${{ env.ONLY_CACHE == 'false' }}
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=${{ runner.temp }}/.buildx-cache
+          cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
+
+      - name: Move cache.
+        if: always()
+        run: |
+          if [ -d "${{ runner.temp }}/.buildx-cache-new" ]; then
+            rm -rf ${{ runner.temp }}/.buildx-cache
+            mv ${{ runner.temp }}/.buildx-cache-new ${{ runner.temp }}/.buildx-cache
+          fi
+
+      - name: AyuGram build.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          docker run --rm \
+          -u $(id -u) \
+          -v $PWD:/usr/src/tdesktop \
+          -e CONFIG=Release \
+          $IMAGE_TAG \
+          /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+          -D CMAKE_CONFIGURATION_TYPES=Release \
+          -D TDESKTOP_API_ID=$API_ID \
+          -D TDESKTOP_API_HASH=$API_HASH \
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+      - name: Package.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          if [ ! -f out/Release/AyuGram ]; then
+            echo "::error::AyuGram binary not found in out/Release"
+            ls -la out/Release || true
+            exit 1
+          fi
+          tar -czf AyuGram-linux-x64.tar.gz -C out/Release AyuGram
+
+      # Linux has no single native installer, so the portable tarball above is
+      # joined by an AppImage: one executable file, no root, no package manager,
+      # and it registers its own menu entry and tg:// handler when integrated.
+      #
+      # The binary out of centos_env is self-contained the same way upstream's
+      # own Linux release is, so the AppDir needs nothing bundled alongside it.
+      # Never fatal, for the same reason as the Windows installer: the tarball
+      # already exists and must not be lost to a convenience artifact.
+      - name: AppImage.
+        if: env.ONLY_CACHE == 'false'
+        continue-on-error: true
+        env:
+          # Release assets are mutable under any tag, so pin the bytes rather
+          # than a version. If either check below ever fails, upstream rebuilt
+          # the file: verify the new one and update the hash, do not delete the
+          # check.
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          APPIMAGETOOL_SHA256: a6d71e2b6cd66f8e8d16c37ad164658985e0cf5fcaa950c90a482890cb9d13e0
+          # appimagetool does not bundle the type-2 runtime. Left to itself it
+          # fetches one from a rolling tag with no integrity check at all, and
+          # that runtime is prepended to the output — it is the first code that
+          # runs on a user's machine. type2-runtime does publish dated releases,
+          # so pin one and hand it over explicitly.
+          RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64
+          RUNTIME_SHA256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+        run: |
+          set -euo pipefail
+
+          APPDIR=AppDir
+          rm -rf "$APPDIR"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications"
+          cp out/Release/AyuGram "$APPDIR/usr/bin/"
+          chmod +x "$APPDIR/usr/bin/AyuGram"
+
+          # Derived from the tracked desktop entry so the translations, MIME
+          # handlers and actions stay in sync, minus the three keys that only
+          # make sense for a packaged install:
+          #   TryExec       resolves against PATH, and an AppImage is not on it;
+          #   DBusActivatable needs the .service file an AppImage cannot install;
+          #   env in Exec  breaks the desktop-integration tools, which rewrite
+          #                Exec by replacing its first token with the AppImage.
+          sed -e '/^TryExec=/d' \
+              -e '/^DBusActivatable=/d' \
+              -e 's|^Exec=env DESKTOPINTEGRATION=1 |Exec=|' \
+              lib/xdg/com.ayugram.desktop.desktop > "$APPDIR/com.ayugram.desktop.desktop"
+          # Check the [Desktop Entry] Exec specifically. A plain grep over the
+          # file would be satisfied by '[Desktop Action quit]'s own Exec=, which
+          # the sed never touches — so it would pass even if the main Exec= line
+          # were reworded or deleted outright, which is the one thing this is
+          # here to catch.
+          MAIN_EXEC=$(awk '/^\[Desktop Entry\]/ { d = 1; next } /^\[/ { d = 0 } d && /^Exec=/ { print; exit }' \
+            "$APPDIR/com.ayugram.desktop.desktop")
+          case "$MAIN_EXEC" in
+            "Exec=AyuGram "*) ;;
+            *)
+              echo "::error::[Desktop Entry] Exec= is not what this step expects: '${MAIN_EXEC:-<none>}'"
+              grep -n '^Exec=' "$APPDIR/com.ayugram.desktop.desktop"
+              exit 1
+              ;;
+          esac
+          cp "$APPDIR/com.ayugram.desktop.desktop" "$APPDIR/usr/share/applications/"
+
+          # Icon= names com.ayugram.desktop, so every copy must too. The root
+          # one and .DirIcon are what the AppImage spec reads; the hicolor tree
+          # is what the desktop uses once the AppImage is integrated.
+          for size in 16 32 48 64 128 256 512; do
+            src="Telegram/Resources/art/icon$size.png"
+            [ -f "$src" ] || continue
+            dest="$APPDIR/usr/share/icons/hicolor/${size}x${size}/apps"
+            mkdir -p "$dest"
+            cp "$src" "$dest/com.ayugram.desktop.png"
+          done
+          cp Telegram/Resources/art/icon256.png "$APPDIR/com.ayugram.desktop.png"
+          cp Telegram/Resources/art/icon256.png "$APPDIR/.DirIcon"
+
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="$HERE/usr/bin:$PATH"
+          export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          exec "$HERE/usr/bin/AyuGram" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+          fetch() { # fetch <url> <dest> <sha256>
+            curl -fsSL --retry 3 --retry-all-errors --retry-delay 5 -o "$2" "$1"
+            echo "$3  $2" | sha256sum -c - \
+              || { echo "::error::$2 does not match its pinned hash — see the comments in this step's env block"; exit 1; }
+          }
+          fetch "$APPIMAGETOOL_URL" appimagetool "$APPIMAGETOOL_SHA256"
+          fetch "$RUNTIME_URL" runtime-x86_64 "$RUNTIME_SHA256"
+          chmod +x appimagetool
+
+          # ubuntu-latest has no libfuse2, so the tool cannot mount itself;
+          # extract-and-run is the supported way round that. It also re-execs
+          # from a temp directory, which is why the runtime needs an absolute
+          # path rather than the relative one that works everywhere else here.
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool \
+            --runtime-file "$PWD/runtime-x86_64" \
+            "$APPDIR" AyuGram-linux-x64.AppImage
+          chmod +x AyuGram-linux-x64.AppImage
+
+      - name: Upload artifact.
+        if: env.ONLY_CACHE == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: AyuGram-linux-x64
+          path: |
+            AyuGram-linux-x64.tar.gz
+            AyuGram-linux-x64.AppImage
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    needs: guard
+    if: needs.guard.outputs.skip != 'true' && needs.guard.outputs.reuse_from == ''
+    runs-on: macos-latest
+    timeout-minutes: 350
+    # The macOS runner has the least disk of the three and this build wants ~55 GB
+    # (docs/building-mac.md). Never let it block a release. Note this also forces
+    # needs.macos.result to 'success' even on failure, which is why the release job
+    # reports macOS by artifact presence rather than by job result.
+    continue-on-error: true
+
+    env:
+      PREPARE_PATH: 'Telegram/build/prepare/prepare.py'
+
+    steps:
+      - name: Get repository name.
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+          path: ${{ env.REPO_NAME }}
+
+      # Before the cache steps below, which hashFiles() prepare.py.
+      - name: Apply CI patches.
+        run: bash $REPO_NAME/.github/scripts/ci-patch.sh $REPO_NAME
+
+      - name: First set up.
+        run: |
+          # libtool is GNU libtool, needed for its aclocal m4 macros (LT_INIT).
+          # tdesktop 7.0.9 added a `cd contrib/minizip && autoreconf -fi` step to
+          # the mac zlib stage; without libtool.m4 on aclocal's search path that
+          # dies with "Libtool library used but 'LIBTOOL' is undefined" and takes
+          # the whole Libraries step with it. macOS ships /usr/bin/libtool, but
+          # that is Apple's static-archiver, a different tool that provides no m4.
+          brew install automake libtool meson nasm ninja pkg-config
+          sudo mdutil -a -i off
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+          df -h /
+
+          # The image ships several Xcodes at ~15 GB each and leaves far less free
+          # than this build needs — prepare.py compiles the libraries universal
+          # (x86_64 + arm64) and, without 'skip-release', Qt -debug-and-release.
+          KEEP="$(readlink -f /Applications/Xcode.app)"
+          FREED=0
+          for app in /Applications/Xcode_*.app; do
+            [ -e "$app" ] || continue
+            if [ "$(readlink -f "$app")" != "$KEEP" ]; then
+              sudo rm -rf "$app" && FREED=$((FREED + 1))
+            fi
+          done
+          echo "Removed $FREED unused Xcode installs."
+          df -h /
+
+      - name: ThirdParty cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ThirdParty
+          key: ${{ runner.os }}-${{ runner.arch }}-third-party-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-third-party-
+
+      - name: Libraries cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Libraries
+          key: ${{ runner.os }}-${{ runner.arch }}-libs-${{ hashFiles(format('{0}/{1}', env.REPO_NAME, env.PREPARE_PATH)) }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-libs-
+
+      - name: Libraries.
+        run: |
+          ./$REPO_NAME/Telegram/build/prepare/mac.sh silent
+          df -h /
+
+      - name: AyuGram build.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          cd $REPO_NAME/Telegram
+
+          ./configure.sh \
+          -D CMAKE_CONFIGURATION_TYPES=Release \
+          -D TDESKTOP_API_ID=$API_ID \
+          -D TDESKTOP_API_HASH=$API_HASH \
+          -D CMAKE_XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED=NO \
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          # cmake --build, not `xcodebuild -scheme Telegram`: CMake's Xcode
+          # generator writes no shared schemes, so -scheme has nothing to resolve.
+          cmake --build ../out --config Release --parallel
+
+      - name: Package.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          OUT="$REPO_NAME/out/Release"
+          if [ ! -d "$OUT/AyuGram.app" ]; then
+            echo "::error::AyuGram.app not found in $OUT"
+            ls -la "$OUT" || true
+            exit 1
+          fi
+          # The build runs with CODE_SIGNING_ALLOWED=NO, which leaves the bundle
+          # with no signature at all — and macOS on Apple Silicon refuses to
+          # launch such a binary outright. An ad-hoc signature ('-') costs
+          # nothing, needs no certificate, and turns that hard refusal back into
+          # the ordinary unidentified-developer prompt. Never fatal: an unsigned
+          # bundle is still worth shipping, and it is what we shipped before.
+          if codesign --force --deep --sign - "$OUT/AyuGram.app" \
+            && codesign --verify --deep "$OUT/AyuGram.app"; then
+            echo "Ad-hoc signed."
+          else
+            echo "::warning::Ad-hoc signing failed — the bundle ships unsigned and will not launch on Apple Silicon."
+          fi
+
+          # ditto, not zip: it preserves the bundle's symlinks and permission bits.
+          ditto -c -k --sequesterRsrc --keepParent "$OUT/AyuGram.app" AyuGram-macos.zip
+
+      # The .dmg is how macOS software is actually handed out: mount it, drag the
+      # app onto the Applications alias sitting next to it, eject. Its own step,
+      # and never fatal, so a dmg failure cannot cost us the zip made above —
+      # this runner is the one most likely to run out of disk, and hdiutil is
+      # known to hit transient 'resource busy' on hosted runners.
+      - name: DMG.
+        if: env.ONLY_CACHE == 'false'
+        continue-on-error: true
+        run: |
+          OUT="$REPO_NAME/out/Release"
+
+          # mv rather than a second ditto: the zip is already made and nothing
+          # reads the bundle after this, so there is no reason to hold two full
+          # copies on a volume this job had to delete Xcode installs to fit in.
+          STAGE="$(mktemp -d)/AyuGram"
+          mkdir -p "$STAGE"
+          mv "$OUT/AyuGram.app" "$STAGE/AyuGram.app"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname AyuGram -srcfolder "$STAGE" \
+            -fs HFS+ -format UDZO -ov AyuGram-macos.dmg
+
+      - name: Upload artifact.
+        if: env.ONLY_CACHE == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: AyuGram-macos
+          path: |
+            AyuGram-macos.zip
+            AyuGram-macos.dmg
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [guard, windows, linux, macos]
+    # `inputs.publish != false` would be wrong: on a push `inputs` is null, and
+    # loose equality casts both null and false to 0, so it would never publish.
+    # The guard clauses let this run with every build job skipped, in the case
+    # where binaries for this commit already exist and are simply being copied.
+    if: |
+      always()
+      && !cancelled()
+      && needs.guard.outputs.skip != 'true'
+      && inputs.only_cache != true
+      && (github.event_name == 'push' || inputs.publish)
+      && (needs.guard.outputs.reuse_from != ''
+          || needs.windows.result == 'success'
+          || needs.linux.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Clone.
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download artifacts.
+        if: needs.guard.outputs.reuse_from == ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          # Only our build outputs. Without a pattern this also pulls the
+          # `*.dockerbuild` build-record artifact that docker/build-push-action
+          # uploads, and a transient failure downloading that junk fails the
+          # whole publish (it did — the three real artifacts came down fine).
+          pattern: AyuGram-*
+          path: dist
+          merge-multiple: true
+
+      # Same commit, so the binaries would be identical. Copy them across rather
+      # than spending hours producing the same bytes under a different tag.
+      - name: Reuse the existing binaries.
+        if: needs.guard.outputs.reuse_from != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ needs.guard.outputs.reuse_from }}" \
+            --repo "$GITHUB_REPOSITORY" --dir dist --clobber
+          echo "Copied from '${{ needs.guard.outputs.reuse_from }}':"
+          ls -la dist
+
+      - name: Work out the release.
+        id: meta
+        run: |
+          if [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+            echo "rolling=false" >> $GITHUB_OUTPUT
+          else
+            echo "tag=continuous" >> $GITHUB_OUTPUT
+            echo "name=Continuous build" >> $GITHUB_OUTPUT
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+            echo "rolling=true" >> $GITHUB_OUTPUT
+          fi
+
+          # Report by artifact presence. needs.macos.result cannot be trusted:
+          # job-level continue-on-error rewrites it to 'success' on failure.
+          for row in \
+            "windows_setup:AyuGram-windows-x64-setup.exe" \
+            "windows:AyuGram-windows-x64.zip" \
+            "linux_setup:AyuGram-linux-x64.AppImage" \
+            "linux:AyuGram-linux-x64.tar.gz" \
+            "macos_setup:AyuGram-macos.dmg" \
+            "macos:AyuGram-macos.zip"; do
+            k="${row%%:*}"; f="${row#*:}"
+            if [ -f "dist/$f" ]; then
+              echo "$k=\`$f\`" >> $GITHUB_OUTPUT
+            else
+              echo "$k=not built" >> $GITHUB_OUTPUT
+            fi
+          done
+
+      - name: Move the rolling tag.
+        if: steps.meta.outputs.rolling == 'true'
+        run: |
+          # The releases API ignores target_commitish once the tag exists, so the
+          # tag has to be moved by hand or 'continuous' stays on the first build.
+          git tag -f continuous ${{ github.sha }}
+          git push -f origin refs/tags/continuous
+
+      # Publishing only ever replaces same-named assets, never removes others.
+      # So a run where one platform failed would leave that platform's assets
+      # from a PREVIOUS commit sitting on the release, under a body that now
+      # claims this commit. The guard checks completeness by asset name only, so
+      # it would then read that release as fully built and either skip a rebuild
+      # or copy another commit's binaries forward onto a permanent v* tag.
+      #
+      # Deleting what this run did not produce keeps the release honest: it goes
+      # out short, the guard sees it as incomplete, and the next run rebuilds.
+      - name: Drop assets this run is not replacing.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG='${{ steps.meta.outputs.tag }}'
+
+          # No release yet on a first publish — nothing to prune, not an error.
+          ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name' 2>/dev/null || true)
+
+          for a in $ASSETS; do
+            if [ ! -f "dist/$a" ]; then
+              echo "Deleting stale '$a' — this run did not produce it."
+              # A warning, not a failure: leaving a stale asset behind is worse
+              # than publishing, and the guard will still force a rebuild.
+              gh release delete-asset "$TAG" "$a" --repo "$GITHUB_REPOSITORY" -y \
+                || echo "::warning::Could not delete stale asset '$a'."
+            fi
+          done
+
+      - name: Publish.
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          make_latest: ${{ steps.meta.outputs.rolling == 'false' }}
+          files: dist/**
+          fail_on_unmatched_files: true
+          body: |
+            Built by GitHub Actions from `${{ github.sha }}`.
+
+            Auto-update is disabled in these builds, so they will not replace
+            themselves with binaries from AyuGram's own update server.
+
+            | Platform | Installer | Portable |
+            | --- | --- | --- |
+            | Windows x64 | ${{ steps.meta.outputs.windows_setup }} | ${{ steps.meta.outputs.windows }} |
+            | Linux x64 | ${{ steps.meta.outputs.linux_setup }} | ${{ steps.meta.outputs.linux }} |
+            | macOS | ${{ steps.meta.outputs.macos_setup }} | ${{ steps.meta.outputs.macos }} |
+
+            **Windows** — the installer is per-user, so it needs no administrator
+            rights and installs into `%APPDATA%\AyuGram Desktop`. It is not
+            code-signed, so SmartScreen will warn: *More info* → *Run anyway*.
+
+            **Linux** — `chmod +x AyuGram-linux-x64.AppImage`, then run it. No
+            root and no package manager involved.
+
+            **macOS** — open the `.dmg` and drag AyuGram to Applications. The app
+            is only ad-hoc signed, never notarised, so macOS blocks the first
+            launch. Clear the quarantine flag:
+            ```
+            xattr -dr com.apple.quarantine /Applications/AyuGram.app
+            ```
+            Without a terminal: try to open it, dismiss the warning, then go to
+            System Settings → Privacy & Security → *Open Anyway*. (Control-click
+            → *Open* no longer works — Apple removed that route in macOS 15.)
