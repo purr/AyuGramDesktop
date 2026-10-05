@@ -44,6 +44,25 @@ sed_i() { # sed_i <expr> <file>
 	mv "$tmp" "$2" || { rm -f "$tmp"; fail "could not write $2"; }
 }
 
+# repin <url-fragment> <old-tag> <wanted-tag>
+# Moves a `git clone -b <tag> https://github.com/<fragment>` pin in prepare.py.
+# A third, unexpected tag fails rather than being left alone: prepare.py comes
+# from upstream, so any other value means upstream moved the pin itself and the
+# choice needs a human, not a silent no-op.
+repin() {
+	local frag="$1" from="$2" to="$3"
+	if grep -q "git clone -b $from https://github.com/$frag" "$PREPARE"; then
+		sed_i "s|git clone -b $from https://github.com/$frag|git clone -b $to https://github.com/$frag|" "$PREPARE"
+		grep -q "git clone -b $to https://github.com/$frag" "$PREPARE" \
+			|| fail "could not repin $frag to $to"
+		echo "patched: $frag $from -> $to"
+	elif grep -q "git clone -b $to https://github.com/$frag" "$PREPARE"; then
+		echo "skipped: $frag already at $to"
+	else
+		fail "$frag is pinned at neither $from nor $to in $PREPARE — upstream moved it, re-check this patch"
+	fi
+}
+
 for f in "$PREPARE" "$INFRA" "$SETUP"; do
 	[ -f "$f" ] || fail "$f not found — wrong root?"
 done
@@ -168,6 +187,31 @@ elif grep -qE '^[[:space:]]*(diffutils|mingw-w64-ucrt-x86_64-diffutils)[[:space:
 else
 	fail "no diffutils package in $PREPARE — upstream changed the msys64 stage, re-check this patch"
 fi
+
+# Security bumps for leaf decoders, where the version tdesktop 7.2.9 pins is
+# covered by published advisories. Only libraries with no API coupling to the
+# app's own sources are moved here: FFmpeg n6.1.6 -> n8.1.3, tg_owt and the
+# patches repo are all newer upstream too, but upstream shipped each of those
+# alongside source changes this tree does not have, so bumping them here would
+# break the build rather than harden it.
+
+# libheif 1.23.1 is covered by four critical advisories from its maintainers,
+# among them GHSA-2jg2-4ch7-h545 ("Remote Code Execution: Out-of-bounds read
+# and write in derived-item and pixel-plane handling") and CVE-2026-84383, a
+# heap overflow in scale_nearest_neighbor(). libheif is linked in as a Qt
+# kimageformats plugin, so Qt hands it every HEIC the user receives. 1.23.6 is
+# the first release outside every published range — upstream's own 1.23.5 is
+# still inside the batch published on 2026-10-05. The CMakeLists sed patches
+# below still match at 1.23.6, and WITH_LIBDE265 stays on, so libde265 is
+# still required here even though upstream dropped it with its FFmpeg backend.
+repin strukturag/libheif.git v1.23.1 v1.23.6
+
+# xz 5.4.5 is covered by two high advisories: an invalid write when a decoder
+# is reinitialized after an allocation failure (fixed in 5.8.4) and a threaded
+# decoder freeing memory too early (fixed in 5.8.1). The stage is !win, so this
+# reaches only the Linux and macOS builds; 5.4.5 predates the 5.6.0 backdoor,
+# so this is not that. The stage's futimens sed still matches at 5.8.4.
+repin tukaani-project/xz.git v5.4.5 v5.8.4
 
 # ---------------------------------------------------------------------------
 # 2. Silence the update.ayugram.one beacon.
