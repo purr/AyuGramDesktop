@@ -17,6 +17,10 @@ on:
       - '!LICENSE'
       - '!.github/**'
       - '.github/workflows/build.yml'
+      # ci-patch.sh rewrites the sources this workflow compiles, so a change
+      # to it has to build. Without this it lands under '!.github/**' and the
+      # push is silently dropped with no run at all.
+      - '.github/scripts/**'
   workflow_dispatch:
     inputs:
       only_cache:
