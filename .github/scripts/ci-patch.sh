@@ -63,6 +63,24 @@ repin() {
 	fi
 }
 
+# repin_commit <name> <old-sha> <new-sha>
+# The same contract as repin, for the stages pinned by `git checkout <sha>`
+# instead of a tag. A full sha is unique in the file, so <name> only labels the
+# message.
+repin_commit() {
+	local name="$1" from="$2" to="$3"
+	if grep -q "git checkout $from" "$PREPARE"; then
+		sed_i "s|git checkout $from|git checkout $to|" "$PREPARE"
+		grep -q "git checkout $to" "$PREPARE" \
+			|| fail "could not repin $name to $to"
+		echo "patched: $name ${from:0:10} -> ${to:0:10}"
+	elif grep -q "git checkout $to" "$PREPARE"; then
+		echo "skipped: $name already at ${to:0:10}"
+	else
+		fail "$name is pinned at neither ${from:0:10} nor ${to:0:10} in $PREPARE — upstream moved it, re-check this patch"
+	fi
+}
+
 for f in "$PREPARE" "$INFRA" "$SETUP"; do
 	[ -f "$f" ] || fail "$f not found — wrong root?"
 done
@@ -188,12 +206,18 @@ else
 	fail "no diffutils package in $PREPARE — upstream changed the msys64 stage, re-check this patch"
 fi
 
-# Security bumps for leaf decoders, where the version tdesktop 7.2.9 pins is
-# covered by published advisories. Only libraries with no API coupling to the
-# app's own sources are moved here: FFmpeg n6.1.6 -> n8.1.3, tg_owt and the
-# patches repo are all newer upstream too, but upstream shipped each of those
-# alongside source changes this tree does not have, so bumping them here would
-# break the build rather than harden it.
+# Security and maintenance bumps, for pins where the version tdesktop 7.2.9
+# carries is covered by published advisories or has been superseded upstream.
+# Every one of these is a version string: nothing in this block needs a change
+# to the app's own sources, which is what makes them safe to take piecemeal.
+#
+# FFmpeg is the deliberate omission. n6.1.6 is the last release on the 6.1
+# branch, so there is no in-branch patch to take, and n8.1.3 links only with
+# the cmake_helpers revision that renames the ffmpeg libraries — which also
+# switches libheif's decoder from libde265 to FFmpeg, and so needs this
+# stage's flags and the cmake submodule moved with it. That set is coherent
+# but it is three interlocking changes, so it belongs in its own commit where
+# a failure is attributable, not bundled in here.
 
 # libheif 1.23.1 is covered by four critical advisories from its maintainers,
 # among them GHSA-2jg2-4ch7-h545 ("Remote Code Execution: Out-of-bounds read
@@ -212,6 +236,24 @@ repin strukturag/libheif.git v1.23.1 v1.23.6
 # reaches only the Linux and macOS builds; 5.4.5 predates the 5.6.0 backdoor,
 # so this is not that. The stage's futimens sed still matches at 5.8.4.
 repin tukaani-project/xz.git v5.4.5 v5.8.4
+
+# OpenSSL 3.2.1 dates from early 2024 and OSV lists seven CVEs against it
+# (CVE-2025-27587 plus six from 2026). 3.2.6 is the newest release on the same
+# branch, so this takes the fixes without an API or ABI change. tdesktop still
+# pins 3.2.1, so this is a deliberate divergence — kept inside the 3.2 branch
+# rather than jumping to 3.5, because this sits under the MTProto crypto.
+repin openssl/openssl openssl-3.2.1 openssl-3.2.6
+
+# tg_owt is the WebRTC stack behind calls. Upstream moved it in 59a99381cf
+# ("Update tg_owt with some fixes and hardenings"), which changed version
+# strings and nothing else, so the newer revision asks nothing of this tree.
+repin_commit tg_owt 89df288dd6ba5b2ec95b3c5eaf1e7e0c3a870fc4 e2d0e88d1bde6cc600da5dc92581dc97e4c1e685
+
+# The patches repo holds the Qt patches prepare.py applies before building it;
+# the newer revision adds fixes for fontconfig and for crashes on a DPI change.
+# The Qt mkspecs patch further up anchors on prepare.py rather than on anything
+# in this repo, so the two do not interact.
+repin_commit patches 519aaa084608fa6f9a2bfbd1959d133c44d94227 4ca9e1e9d86cc87b78c2480f41ba61871c76f2fa
 
 # ---------------------------------------------------------------------------
 # 2. Silence the update.ayugram.one beacon.
