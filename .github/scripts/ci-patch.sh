@@ -147,6 +147,28 @@ else
 	echo "skipped: dump_syms already dropped"
 fi
 
+# MSYS2 dropped the mingw64 build of diffutils on 2026-09-27 ("diffutils: drop
+# mingw64" in msys2/MINGW-packages), so mingw-w64-x86_64-diffutils no longer
+# resolves and pacman kills the whole msys64 stage 90s in with "target not
+# found", before any library is built. Only diffutils lost mingw64 — gperf,
+# nasm, perl and pkgconf still publish it — so this repoints that one package
+# at the msys build, which is what prepare.py asked for until 5938e0f821
+# switched it to the native one. It installs into msys64\usr\bin, already on
+# this stage's PATH.
+#
+# Upstream's own fix was to move the entire stage to the ucrt64 prefix, which
+# also requires prepare.py's mingw64\bin PATH entry to change; the ucrt spelling
+# is accepted below so that merging that rework reports a skip instead of a
+# failure.
+if grep -q 'mingw-w64-x86_64-diffutils' "$PREPARE"; then
+	sed_i 's|mingw-w64-x86_64-diffutils|diffutils|' "$PREPARE"
+	echo "patched: diffutils -> msys build (MSYS2 dropped the mingw64 one)"
+elif grep -qE '^[[:space:]]*(diffutils|mingw-w64-ucrt-x86_64-diffutils)[[:space:]]*\^?[[:space:]]*$' "$PREPARE"; then
+	echo "skipped: diffutils already resolvable (msys or ucrt64 build)"
+else
+	fail "no diffutils package in $PREPARE — upstream changed the msys64 stage, re-check this patch"
+fi
+
 # ---------------------------------------------------------------------------
 # 2. Silence the update.ayugram.one beacon.
 #
