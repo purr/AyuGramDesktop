@@ -965,7 +965,9 @@ jobs:
           else
             echo "tag=continuous" >> $GITHUB_OUTPUT
             echo "name=Continuous build" >> $GITHUB_OUTPUT
-            echo "prerelease=true" >> $GITHUB_OUTPUT
+            # Not a prerelease: GitHub never shows one as "Latest", and the
+            # rolling build is what users are meant to download.
+            echo "prerelease=false" >> $GITHUB_OUTPUT
             echo "rolling=true" >> $GITHUB_OUTPUT
           fi
 
@@ -1029,7 +1031,10 @@ jobs:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           prerelease: ${{ steps.meta.outputs.prerelease }}
-          make_latest: ${{ steps.meta.outputs.rolling == 'false' }}
+          # Always, including the rolling build. 'continuous' keeps its original
+          # creation date, so date-based "latest" would never pick it; passing
+          # this explicitly is what puts it at the top of the releases page.
+          make_latest: true
           files: dist/**
           fail_on_unmatched_files: true
           body: |
